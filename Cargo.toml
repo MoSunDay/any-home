@@ -1,0 +1,29 @@
+# anyhome root workspace.
+# NOTE: link_repos/* are path dependencies (read-only embedded deps), NOT members.
+[workspace]
+resolver = "2"
+members = ["crates/anyhome"]
+# link_repos/* are foreign workspaces (read-only embedded deps),
+# explicitly excluded so cargo resolves their internal `.workspace=true`
+# inheritance against THEIR own roots, not this one.
+exclude = ["link_repos"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+
+[workspace.dependencies]
+# local crates
+anyhome = { path = "crates/anyhome" }
+# read-only embedded deps (pinned via scripts/bootstrap.sh)
+nfsserve = { path = "link_repos/nfsserve" }
+libsql = { path = "link_repos/libsql/libsql", default-features = false, features = ["core"] }
+# shared third-party
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+tempfile = "3"

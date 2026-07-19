@@ -1,0 +1,30 @@
+[package]
+name = "anyhome"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "anyhome"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anyhome"
+path = "src/main.rs"
+
+[dependencies]
+nfsserve.workspace = true
+libsql.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+async-trait.workspace = true
+# MSRV pin: libsql-ffi pulls bindgen -> which -> home v0.5.12 (needs Rust 1.88).
+# We build on 1.85.0 (pinned via rust-toolchain.toml), so force a compatible home.
+home = "=0.5.9"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
