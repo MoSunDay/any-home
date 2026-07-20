@@ -120,7 +120,9 @@ fn hex_val(c: u8) -> Option<u8> {
 }
 
 /// Registry of synthetic files seen via lookup/create: fileid -> decoded name.
-/// Process-local; not persisted.
+/// Process-local; the `/index` category is additionally rebuilt from the DB on
+/// `readdir` (see `dispatcher`), so its listing survives a restart even though
+/// this map itself does not.
 #[derive(Default)]
 pub struct MagicRegistry {
     inner: Mutex<HashMap<fileid3, String>>,

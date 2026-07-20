@@ -33,7 +33,9 @@ agent 用「读文件 / 写文件」这一最通用的能力即可访问记忆�
 - **向量检索**：`cat /search/语义相关的笔记` —— 路径即 query，读到的「文件内容」就是 DB 的
   检索结果。
 - **写入即索引**：`echo "待检索文本" > /index/<key>` —— 写入同时被向量化入库，供日后检索。
-- **过滤 / 全文查询**：`cat /where/<条件>` —— 以路径表达条件，返回 DB 命中结果。
+- **过滤 / 全文查询**：`cat /where/<词>` —— SQLite FTS5 全文检索（MATCH），返回命中记忆的
+  `key\ttext` 行；`cat /where/key:<前缀>` 则按 key 前缀过滤（如 `cat /where/key:gree`
+  命中所有 key 以 `gree` 开头的记忆）。
 
 实现上对 NFS 协议做一次薄改：命中特定「查询目录」前缀的 `read` / `write` 不落盘，而是把路径
 解析为查询、把结果作为文件内容返回。对 agent 而言，整个记忆系统始终是一棵统一的、可挂载的
@@ -105,6 +107,14 @@ echo "hello anyhome" > /mnt/anyhome/index/greeting
 cat /mnt/anyhome/search/hello%20anyhome
 # => greeting	hello anyhome
 
+# FTS5 全文检索：命中所有 text 包含该词的记忆
+cat /mnt/anyhome/where/anyhome
+# => greeting	hello anyhome
+
+# 按 key 前缀过滤
+cat /mnt/anyhome/where/key:gree
+# => greeting	hello anyhome
+
 # 文件系统层照常可用
 mkdir -p /mnt/anyhome/notes && echo "普通文件" > /mnt/anyhome/notes/a.md
 ls /mnt/anyhome            # index/  search/  where/  notes/  ...
@@ -115,18 +125,51 @@ ls /mnt/anyhome            # index/  search/  where/  notes/  ...
 scripts/e2e.sh            # 自动构建→启动→挂载→index/search→断言→清理
 ```
 
-> 当前 `/search` 由 `DummyEmbedder`（确定性、无依赖）驱动：相同文本 → 余弦相似度 1 → 命中 top-1。
-> 真正的语义嵌入（TODO-04）落地后，`/search/语义近似的问法` 即可语义召回。
+> 默认 `/search` 由 `DummyEmbedder`（确定性、零依赖）驱动：相同文本 → 余弦相似度 1 → 命中 top-1。
+> 真正的语义嵌入（local ONNX `Qdrant/all-MiniLM-L6-v2`，dim=384）已落地，但 feature-gated、默认关闭：
+>
+> ```bash
+> # 一次性预取模型到标准 HF cache（离线 / 镜像环境用）
+> scripts/fetch-model.sh          # 或 scripts/fetch-model.sh --mirror 走 hf-mirror.com
+>
+> # 带 fastembed feature 构建 + 以真实 embedder 启动
+> cargo build --workspace --features embed-fastembed
+> ./target/debug/anyhome --embedder fastembed \
+>     --fs-root ./anyhome-fs --db-path ./memories.db --addr 127.0.0.1:11111
+> ```
+>
+> 此时 `/search/语义近似的问法` 即可语义召回（10 条 paraphrase 集合上 recall@3 = 1.00，DummyEmbedder 仅 0.30）。
+
+### 6. 持久化
+记忆持久化在 SQLite/libSQL DB 文件（`--db-path`）里，进程重启后照常存活：
+
+- 嵌入维度记录在 `meta` 表（首次打开写入），启动时校验；与历史数据不匹配即**硬错误**（拒绝启动），防止维度错配损坏索引。
+- FTS5 全文索引随 DB 同表保存；若启动时索引为空（如外部重建后），自动 `rebuild` 填充。
 
 ## 状态
 
-核心链路已打通并通过测试（`cargo test --workspace`，19 用例全绿）：
+核心链路已打通并通过测试：
+
+- `cargo test --workspace` = **35 用例全绿**（默认、零依赖）。
+- `cargo test --workspace --features embed-fastembed` = **39 用例全绿**（模型可用时；模型缺失自动跳过 fastembed 相关测试）。
+
+能力：
 
 - 依赖内嵌：`link_repos/{nfsserve,libsql}` 经 `scripts/bootstrap.sh` 可复现 pin。
 - NFS 后端分流：`AnyHomeFs`（dispatcher）把魔法路径导向 DB 层、其余路径导向文件系统层（`RealFs`）。
-- 魔法路径：`/search/<q>`（向量 KNN）、`/index/<key>`（写入即索引）、`/where/<cond>`（预留）。
+- 魔法路径：`/search/<q>`（向量 KNN）、`/index/<key>`（写入即索引）、`/where/<词>`（FTS5 全文 MATCH）/ `/where/key:<前缀>`（key 前缀过滤）。
 - 向量检索：基于 libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，`vector_top_k` 已验证可按余弦距离排序。
-- CLI：`anyhome --fs-root/--db-path/--addr/--export/--dim`，单端口服务。
+- 持久化：记忆写入 `--db-path` 指定的 DB 文件，重启存活；嵌入维度存于 `meta` 表、启动校验（不匹配=硬错误），FTS5 索引启动时按需自动重建。
+- CLI：`anyhome --fs-root/--db-path/--addr/--export/--dim/--embedder`，单端口服务。
 
-未决：TODO-04（真实语义 embedder，目前用 `DummyEmbedder` 占位）、TODO-05 的 `/where` 过滤查询、
-TODO-07 的真实挂载 e2e（沙箱无 `mount.nfs` / 内核 NFS，`scripts/e2e.sh` 会在缺失时自动跳过）。
+已解决的 init-pro TODO：
+
+- **TODO-04（真实语义 embedder）= 已解锁**：默认 `DummyEmbedder` 零依赖、确定性；真实语义嵌入（本地 ONNX `Qdrant/all-MiniLM-L6-v2`，dim=384）由 `embed-fastembed` feature + `--embedder fastembed` 开启。10 条 paraphrase 集合上 recall@3 = 1.00（DummyEmbedder 仅 0.30），证明有效。模型不可用时相关测试 / 启动自动跳过。
+- **TODO-05（`/where` 过滤查询）= done**：FTS5 全文 MATCH + `key:<前缀>` 过滤。
+- **TODO-08（持久化 / 重启存活）= done**。
+- **TODO-09（`/where` FTS5 过滤）= done**。
+- **TODO-10（真实语义 embedder）= done**（feature-gated，模型不可用自动跳过）。
+- **TODO-11（`--export` 接线 + mount）= done**。
+- **TODO-12（真实挂载 e2e）= done**（代码层完成；实机验证需 `mount.nfs`，沙箱无此命令时 `scripts/e2e.sh` 自动跳过）。
+
+> 注：init-pro 的 TODO-07（真实挂载 e2e）同 TODO-12——代码与脚本就绪，仅沙箱缺 `mount.nfs` / 内核 NFS 客户端时自动跳过。

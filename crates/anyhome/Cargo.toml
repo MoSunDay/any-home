@@ -12,6 +12,14 @@ path = "src/lib.rs"
 name = "anyhome"
 path = "src/main.rs"
 
+[features]
+# Real semantic embedder via local ONNX (all-MiniLM-L6-v2, dim 384). Off by
+# default so the build stays dependency-light and network-free; opt in with
+# `--features embed-fastembed`. The model is fetched once (HuggingFace) and
+# cached; see scripts/fetch-model.sh for an offline/mirror prefetch.
+default = []
+embed-fastembed = ["dep:fastembed"]
+
 [dependencies]
 nfsserve.workspace = true
 libsql.workspace = true
@@ -21,6 +29,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
+# Real semantic embedder (local ONNX). Optional to keep the default build lean.
+fastembed = { version = "4", optional = true }
 # MSRV pin: libsql-ffi pulls bindgen -> which -> home v0.5.12 (needs Rust 1.88).
 # We build on 1.85.0 (pinned via rust-toolchain.toml), so force a compatible home.
 home = "=0.5.9"

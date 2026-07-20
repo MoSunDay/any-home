@@ -1,6 +1,7 @@
-//! Embedding abstraction. A real semantic model (TODO-04) plugs in here; for now
-//! [`DummyEmbedder`] gives a deterministic, dependency-free stand-in so the
-//! index/search pipeline is verifiable end-to-end.
+//! Embedding abstraction. The real semantic model lives in [`super::fastembed`]
+//! (behind the `embed-fastembed` feature); [`DummyEmbedder`] is the
+//! dependency-free default so the index/search pipeline is verifiable without a
+//! model download.
 
 use anyhow::Result;
 use async_trait::async_trait;

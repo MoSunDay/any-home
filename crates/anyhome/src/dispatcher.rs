@@ -3,7 +3,7 @@
 //!
 //! - `/search/<query>` — read returns KNN results for `<query>` as text.
 //! - `/index/<key>`    — write embeds and upserts the written text under `<key>`.
-//! - `/where/<cond>`   — reserved (full-text/filter; not implemented yet).
+//! - `/where/<cond>`   — read returns FTS5 full-text matches, or `key:<prefix>` key-filter.
 
 use std::sync::Arc;
 
@@ -66,6 +66,30 @@ impl AnyHomeFs {
             .upsert(key, text, &emb)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)
+    }
+
+    /// Full-text / prefix query for `/where/<cond>` -> `<key>\t<text>\n` lines.
+    async fn run_where(&self, cond: &str) -> std::result::Result<Vec<u8>, nfsstat3> {
+        let rows = self
+            .db
+            .where_search(cond, DEFAULT_K)
+            .await
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let mut out = String::new();
+        for (key, text) in rows {
+            out.push_str(&format!("{}\t{}\n", key, text));
+        }
+        Ok(out.into_bytes())
+    }
+
+    /// Read back the stored text for an indexed key (so `/index/<key>` round-trips
+    /// and survives a restart, since the registry is rebuilt from the DB).
+    async fn index_text(&self, key: &str) -> std::result::Result<Vec<u8>, nfsstat3> {
+        match self.db.get_text(key).await {
+            Ok(Some(text)) => Ok(text.into_bytes()),
+            Ok(None) => Ok(format!("# no indexed memory under key: {}\n", key).into_bytes()),
+            Err(_) => Err(nfsstat3::NFS3ERR_IO),
+        }
     }
 }
 
@@ -152,10 +176,8 @@ impl NFSFileSystem for AnyHomeFs {
             let name = self.magic.get(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
             let content = match cat {
                 CAT_SEARCH => self.run_search(&name).await?,
-                CAT_WHERE => {
-                    format!("# /where/{} (not implemented; use /search)\n", name).into_bytes()
-                }
-                CAT_INDEX => format!("# index key: {}\n", name).into_bytes(),
+                CAT_WHERE => self.run_where(&name).await?,
+                CAT_INDEX => self.index_text(&name).await?,
                 _ => Vec::new(),
             };
             return Ok(slice_read(&content, offset, count));
@@ -282,6 +304,17 @@ impl NFSFileSystem for AnyHomeFs {
         max_entries: usize,
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
         if let Some(cat) = dir_category(dirid) {
+            // `/index` is durable storage: rebuild its listing from the DB so a
+            // restart (which clears the in-memory registry) still shows history.
+            if cat == CAT_INDEX {
+                if let Ok(keys) = self.db.list_keys().await {
+                    for key in keys {
+                        let id = magic_file_id(CAT_INDEX, &key);
+                        self.magic.register(id, key);
+                    }
+                }
+                // A list_keys failure just falls back to in-memory entries.
+            }
             let mut rows = self.magic.list_for_cat(cat);
             rows.sort_by_key(|(id, _)| *id);
             let mut entries: Vec<DirEntry> = rows

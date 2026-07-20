@@ -14,3 +14,6 @@ pub use backend::RealFs;
 pub use cli::Cli;
 pub use db::{embedder, MemoryDb};
 pub use dispatcher::AnyHomeFs;
+
+#[cfg(feature = "embed-fastembed")]
+pub use db::fastembed::FastEmbedder;

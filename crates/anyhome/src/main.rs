@@ -6,9 +6,11 @@ use anyhow::Result;
 use clap::Parser;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
-use anyhome::cli::port_of;
+use anyhome::cli::{port_of, EmbedderKind};
 use anyhome::db::{DummyEmbedder, Embedder};
 use anyhome::{AnyHomeFs, Cli, MemoryDb, RealFs};
+#[cfg(feature = "embed-fastembed")]
+use anyhome::FastEmbedder;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,38 +22,76 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if !cli.fs_root.exists() {
+        std::fs::create_dir_all(&cli.fs_root)?;
+    }
+
+    // Pick the embedder first: its dimensionality dictates the DB schema (the
+    // embedding column is FLOAT32(dim)), and MemoryDb validates dim on reopen.
+    let (embedder, dim) = build_embedder(&cli)?;
     tracing::info!(
         fs_root = ?cli.fs_root,
         db_path = %cli.db_path,
         addr = %cli.addr,
         export = %cli.export,
-        dim = cli.dim,
+        embedder = ?cli.embedder,
+        dim,
         "starting anyhome",
     );
 
-    if !cli.fs_root.exists() {
-        std::fs::create_dir_all(&cli.fs_root)?;
-    }
     let real = RealFs::new(cli.fs_root.clone())?;
-    let db = MemoryDb::open(&cli.db_path, cli.dim).await?;
-
-    // TODO-04 (real semantic embedder) is undecided; default to the
-    // dependency-free DummyEmbedder and warn loudly.
-    tracing::warn!(
-        "TODO-04 undecided: using DummyEmbedder — /search does exact-match only, no real semantics yet"
-    );
-    let embedder: Arc<dyn Embedder> = Arc::new(DummyEmbedder::new(cli.dim));
-
+    let db = MemoryDb::open(&cli.db_path, dim).await?;
     let fs = AnyHomeFs::new(real, db, embedder);
-    let listener = NFSTcpListener::bind(&cli.addr, fs).await?;
+
+    // Wire the export name into nfsserve so MOUNT enforces it: a client must
+    // request exactly `host:<export>` or it gets MNT3ERR_NOENT.
+    let mut listener = NFSTcpListener::bind(&cli.addr, fs).await?;
+    listener.with_export_name(&cli.export);
+
     tracing::info!(
         addr = %cli.addr,
         port = port_of(&cli.addr),
         export = %cli.export,
         "NFSv3 listening. mount: mount.nfs -o vers=3,tcp,nolock,noacl,port={p},mountport={p} localhost:{e} /mnt/anyhome",
         p = port_of(&cli.addr),
-        e = cli.export,
+        e = if cli.export == "/" { "/".to_string() } else { cli.export.clone() },
     );
     listener.handle_forever().await?;
     Ok(())
+}
+
+/// Resolve the configured embedder and the dimension it implies.
+///
+/// `dummy` keeps the build dependency-free; `fastembed` (feature-gated) loads
+/// the real ONNX model and pins dim to the model's dim (384), overriding any
+/// explicit `--dim`.
+fn build_embedder(cli: &Cli) -> Result<(Arc<dyn Embedder>, usize)> {
+    match cli.embedder {
+        EmbedderKind::Dummy => {
+            tracing::warn!(
+                "using DummyEmbedder -- /search does exact-match only, no real semantics. \
+                 Build with --features embed-fastembed and pass --embedder fastembed for real semantics."
+            );
+            Ok((Arc::new(DummyEmbedder::new(cli.dim.max(1))), cli.dim.max(1)))
+        }
+        EmbedderKind::Fastembed => {
+            #[cfg(feature = "embed-fastembed")]
+            {
+                let e = FastEmbedder::new()?;
+                let dim = e.dim();
+                if cli.dim != dim {
+                    tracing::warn!("--dim {} ignored: fastembed pins dim to {}", cli.dim, dim);
+                }
+                Ok((Arc::new(e) as Arc<dyn Embedder>, dim))
+            }
+            #[cfg(not(feature = "embed-fastembed"))]
+            {
+                let _ = cli.dim;
+                anyhow::bail!(
+                    "--embedder fastembed requires building with --features embed-fastembed"
+                );
+            }
+        }
+    }
 }
