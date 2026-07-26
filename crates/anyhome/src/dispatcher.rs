@@ -14,8 +14,9 @@ use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use crate::backend::{RealFs, ROOT_ID};
 use crate::db::{Embedder, MemoryDb};
 use crate::magic::{
-    percent_decode, slice_read, magic_attr, magic_category, magic_file_id, is_magic, is_magic_dir,
-    MagicRegistry, CAT_INDEX, CAT_SEARCH, CAT_WHERE, DEFAULT_K, INDEX_DIR, SEARCH_DIR, WHERE_DIR,
+    percent_decode, slice_read, magic_attr, magic_attr_sized, magic_category, magic_file_id,
+    is_magic, is_magic_dir, MagicRegistry, CAT_INDEX, CAT_SEARCH, CAT_WHERE, DEFAULT_K,
+    INDEX_DIR, SEARCH_DIR, WHERE_DIR,
 };
 
 /// The dispatcher filesystem: real FS + DB, joined by magic paths.
@@ -91,6 +92,40 @@ impl AnyHomeFs {
             Err(_) => Err(nfsstat3::NFS3ERR_IO),
         }
     }
+
+    /// Resolve the decoded name for an `/index` fileid, recovering it from the
+    /// DB when the in-memory registry has no entry (e.g. after a restart, before
+    /// the client re-`lookup`s). The recovered name is cached so later calls are
+    /// O(1). `/search`/`/where` names are the query itself with no DB backing, so
+    /// they cannot be recovered this way (they require a fresh `lookup`, which is
+    /// standard NFS reconnect behavior).
+    async fn index_name_for(&self, id: fileid3) -> Option<String> {
+        if let Some(name) = self.magic.get(id) {
+            return Some(name);
+        }
+        let keys = self.db.list_keys().await.ok()?;
+        for key in keys {
+            if magic_file_id(CAT_INDEX, &key) == id {
+                self.magic.register(id, key.clone());
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// Attributes for an `/index` file reflecting its real stored byte size.
+    async fn index_attr(&self, id: fileid3) -> fattr3 {
+        let size = match self.index_name_for(id).await {
+            Some(key) => self
+                .db
+                .get_text(&key)
+                .await
+                .map(|t| t.map(|s| s.len() as u64).unwrap_or(0))
+                .unwrap_or(0),
+            None => 0,
+        };
+        magic_attr_sized(id, size)
+    }
 }
 
 fn dir_category(dirid: fileid3) -> Option<u8> {
@@ -146,6 +181,12 @@ impl NFSFileSystem for AnyHomeFs {
 
     async fn getattr(&self, id: fileid3) -> std::result::Result<fattr3, nfsstat3> {
         if is_magic(id) {
+            if !is_magic_dir(id) && magic_category(id) == CAT_INDEX {
+                // `/index` files report their real byte size so `stat`/`ls -l`
+                // match the content read back. `/search` and `/where` are
+                // dynamic per query and keep the virtual ceiling (magic_attr).
+                return Ok(self.index_attr(id).await);
+            }
             return Ok(magic_attr(id));
         }
         self.real.getattr(id).await
@@ -157,6 +198,17 @@ impl NFSFileSystem for AnyHomeFs {
         setattr: sattr3,
     ) -> std::result::Result<fattr3, nfsstat3> {
         if is_magic(id) {
+            // `/search` and `/where` are read-only query views: mutating their
+            // attributes is rejected (ROFS) rather than silently ignored.
+            // `/index` accepts (ignores) setattr for clients that chmod/truncate
+            // before writing, and reports its real size.
+            if !is_magic_dir(id) {
+                match magic_category(id) {
+                    CAT_SEARCH | CAT_WHERE => return Err(nfsstat3::NFS3ERR_ROFS),
+                    CAT_INDEX => return Ok(self.index_attr(id).await),
+                    _ => {}
+                }
+            }
             return Ok(magic_attr(id));
         }
         self.real.setattr(id, setattr).await
@@ -173,7 +225,11 @@ impl NFSFileSystem for AnyHomeFs {
                 return Err(nfsstat3::NFS3ERR_ISDIR);
             }
             let cat = magic_category(id);
-            let name = self.magic.get(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+            let name = match cat {
+                // `/index` names are recoverable from the DB on a registry miss.
+                CAT_INDEX => self.index_name_for(id).await.ok_or(nfsstat3::NFS3ERR_NOENT)?,
+                _ => self.magic.get(id).ok_or(nfsstat3::NFS3ERR_NOENT)?,
+            };
             let content = match cat {
                 CAT_SEARCH => self.run_search(&name).await?,
                 CAT_WHERE => self.run_where(&name).await?,
@@ -188,21 +244,39 @@ impl NFSFileSystem for AnyHomeFs {
     async fn write(
         &self,
         id: fileid3,
-        _offset: u64,
+        offset: u64,
         data: &[u8],
     ) -> std::result::Result<fattr3, nfsstat3> {
         if is_magic(id) {
             if is_magic_dir(id) {
                 return Err(nfsstat3::NFS3ERR_ISDIR);
             }
-            if magic_category(id) == CAT_INDEX {
-                let key = self.magic.get(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
-                let text = String::from_utf8_lossy(data).into_owned();
-                self.run_index(&key, &text).await?;
+            match magic_category(id) {
+                CAT_INDEX => {
+                    let key = self.index_name_for(id).await.ok_or(nfsstat3::NFS3ERR_NOENT)?;
+                    // Compose positional WRITEs into one buffer: a single `echo`
+                    // or large `cp` arrives as multiple chunks at increasing
+                    // offsets, which would otherwise overwrite each other. Seed
+                    // from the DB on the first write so writes compose with the
+                    // existing content.
+                    if !self.magic.has_buffer(id) {
+                        if let Ok(Some(existing)) = self.db.get_text(&key).await {
+                            self.magic.seed_buffer(id, existing.into_bytes());
+                        }
+                    }
+                    let full = self.magic.write_into(id, offset, data);
+                    // The DB `text` column requires valid UTF-8: reject rather
+                    // than silently corrupt via lossy replacement.
+                    let text = String::from_utf8(full).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+                    self.run_index(&key, &text).await?;
+                    return Ok(self.index_attr(id).await);
+                }
+                // `/search` and `/where` are read-only query views.
+                CAT_SEARCH | CAT_WHERE => return Err(nfsstat3::NFS3ERR_ROFS),
+                _ => return Ok(magic_attr(id)),
             }
-            return Ok(magic_attr(id));
         }
-        self.real.write(id, _offset, data).await
+        self.real.write(id, offset, data).await
     }
 
     async fn create(
@@ -228,6 +302,16 @@ impl NFSFileSystem for AnyHomeFs {
         if let Some(cat) = dir_category(dirid) {
             let name = percent_decode(filename);
             let id = magic_file_id(cat, &name);
+            // Honor the exclusive (O_EXCL) contract: fail if the target already
+            // exists. `/index` checks the durable DB; the query views check the
+            // in-memory registry.
+            let exists = match cat {
+                CAT_INDEX => self.db.exists(&name).await.unwrap_or(false),
+                _ => self.magic.get(id).is_some(),
+            };
+            if exists {
+                return Err(nfsstat3::NFS3ERR_EXIST);
+            }
             self.magic.register(id, name);
             return Ok(id);
         }
@@ -304,17 +388,36 @@ impl NFSFileSystem for AnyHomeFs {
         max_entries: usize,
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
         if let Some(cat) = dir_category(dirid) {
-            // `/index` is durable storage: rebuild its listing from the DB so a
-            // restart (which clears the in-memory registry) still shows history.
+            // `/index` is durable storage: rebuild its listing from the DB with
+            // real byte sizes so a restart (which clears the in-memory registry)
+            // still shows history with accurate attributes.
             if cat == CAT_INDEX {
-                if let Ok(keys) = self.db.list_keys().await {
-                    for key in keys {
-                        let id = magic_file_id(CAT_INDEX, &key);
-                        self.magic.register(id, key);
-                    }
+                let mut sized: Vec<(fileid3, String, u64)> = self
+                    .db
+                    .list_with_size()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, sz)| (magic_file_id(CAT_INDEX, &key), key, sz))
+                    .collect();
+                for (id, key, _) in &sized {
+                    self.magic.register(*id, key.clone());
                 }
-                // A list_keys failure just falls back to in-memory entries.
+                sized.sort_by_key(|(id, _, _)| *id);
+                let mut entries: Vec<DirEntry> = sized
+                    .into_iter()
+                    .filter(|(id, _, _)| *id > start_after)
+                    .map(|(id, name, sz)| DirEntry {
+                        fileid: id,
+                        name: name.into_bytes().into(),
+                        attr: magic_attr_sized(id, sz),
+                    })
+                    .collect();
+                let end = entries.len() <= max_entries;
+                entries.truncate(max_entries);
+                return Ok(ReadDirResult { entries, end });
             }
+            // `/search`, `/where`: in-memory registry listing (virtual sizes).
             let mut rows = self.magic.list_for_cat(cat);
             rows.sort_by_key(|(id, _)| *id);
             let mut entries: Vec<DirEntry> = rows

@@ -150,14 +150,14 @@ scripts/e2e.sh            # 自动构建→启动→挂载→index/search→断�
 
 核心链路已打通并通过测试：
 
-- `cargo test --workspace` = **35 用例全绿**（默认、零依赖）。
-- `cargo test --workspace --features embed-fastembed` = **39 用例全绿**（模型可用时；模型缺失自动跳过 fastembed 相关测试）。
+- `cargo test --workspace` = **45 用例全绿**（默认、零依赖）。
+- `cargo test --workspace --features embed-fastembed` = **49 用例全绿**（模型可用时；模型缺失自动跳过 fastembed 相关测试）。
 
 能力：
 
 - 依赖内嵌：`link_repos/{nfsserve,libsql}` 经 `scripts/bootstrap.sh` 可复现 pin。
 - NFS 后端分流：`AnyHomeFs`（dispatcher）把魔法路径导向 DB 层、其余路径导向文件系统层（`RealFs`）。
-- 魔法路径：`/search/<q>`（向量 KNN）、`/index/<key>`（写入即索引）、`/where/<词>`（FTS5 全文 MATCH）/ `/where/key:<前缀>`（key 前缀过滤）。
+- 魔法路径：`/search/<q>`（向量 KNN）、`/index/<key>`（写入即索引，多段 WRITE 按 offset 拼接不丢数据）、`/where/<词>`（FTS5 全文 MATCH）/ `/where/key:<前缀>`（key 前缀过滤）。`/search`、`/where` 为只读查询视图（写 / setattr 返回 `ROFS`）。
 - 向量检索：基于 libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，`vector_top_k` 已验证可按余弦距离排序。
 - 持久化：记忆写入 `--db-path` 指定的 DB 文件，重启存活；嵌入维度存于 `meta` 表、启动校验（不匹配=硬错误），FTS5 索引启动时按需自动重建。
 - CLI：`anyhome --fs-root/--db-path/--addr/--export/--dim/--embedder`，单端口服务。
@@ -173,3 +173,15 @@ scripts/e2e.sh            # 自动构建→启动→挂载→index/search→断�
 - **TODO-12（真实挂载 e2e）= done**（代码层完成；实机验证需 `mount.nfs`，沙箱无此命令时 `scripts/e2e.sh` 自动跳过）。
 
 > 注：init-pro 的 TODO-07（真实挂载 e2e）同 TODO-12——代码与脚本就绪，仅沙箱缺 `mount.nfs` / 内核 NFS 客户端时自动跳过。
+
+已解决的 init-pro-3 TODO（魔法路径正确性与健壮性）：
+
+- **TODO-14（write 支持 offset）= done**：同一魔法文件的多次 WRITE 按 offset 拼接进写入缓冲区后再落库（之前忽略 offset，大文本被拆成多段 RPC 时互相覆盖）。
+- **TODO-15（create_exclusive 独占语义）= done**：对已存在 key 的独占创建返回 `NFS3ERR_EXIST`（之前对已存在文件仍返回 Ok）。
+- **TODO-16（只读端点显式错误）= done**：对 `/search`、`/where` 的 `write`/`setattr` 返回 `NFS3ERR_ROFS`（之前静默成功空操作）。
+- **TODO-17（getattr 真实大小）= done**：`/index` 文件的 `getattr`/`readdir` 报告真实字节数（之前恒报 1 MiB）。`/search`、`/where` 因内容随查询动态生成，维持虚拟上限值。
+- **TODO-18（句柄跨重启存活）= done**：`/index` 的 fileid→name 映射在内存缺失时可从 DB 推导恢复，旧句柄重启后仍可读（之前内存映射丢失即 `NOENT`）。
+- **TODO-19（write 二进制安全）= done**：去除 `String::from_utf8_lossy` 的静默替换，非 UTF-8 写入显式返回 `NFS3ERR_INVAL`（之前破坏二进制）。
+- **TODO-20（回归测试 + 文档）= done**：新增 `tests/magic_write_semantics.rs`（10 个用例），更新本节与 changelog。
+
+> 已知限制：`/index` 写入缓冲为内存态，进程重启后未落库的缓冲会丢失（NFS 客户端在断开重连后通常会重新 `lookup`，属可接受语义）。多 agent 命名空间隔离（DB 无 `agent_id` 列、魔法路径全局、无鉴权）尚未实现，作为后续方向。

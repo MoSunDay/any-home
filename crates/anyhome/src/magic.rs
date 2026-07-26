@@ -58,20 +58,22 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Synthetic attributes so the client issues the reads/writes we intercept.
-pub fn magic_attr(id: fileid3) -> fattr3 {
+/// Synthetic attributes with a caller-supplied `size`. Directories ignore
+/// `size` (they always report 4096); regular files report exactly `size`, so
+/// `getattr` can pass the real content length for `/index` files.
+pub fn magic_attr_sized(id: fileid3, size: u64) -> fattr3 {
     let dir = is_magic_dir(id);
     let ftype = if dir { ftype3::NF3DIR } else { ftype3::NF3REG };
     let zero = nfstime3 { seconds: 0, nseconds: 0 };
-    let size = if dir { 4096 } else { MAGIC_FILE_SIZE };
+    let reported = if dir { 4096 } else { size };
     fattr3 {
         ftype,
         mode: if dir { 0o755 } else { 0o644 },
         nlink: if dir { 2 } else { 1 },
         uid: 0,
         gid: 0,
-        size,
-        used: size,
+        size: reported,
+        used: reported,
         rdev: specdata3::default(),
         fsid: 0,
         fileid: id,
@@ -79,6 +81,16 @@ pub fn magic_attr(id: fileid3) -> fattr3 {
         mtime: zero,
         ctime: zero,
     }
+}
+
+/// Synthetic attributes with the default virtual size.
+///
+/// - directories: 4096
+/// - regular files: [`MAGIC_FILE_SIZE`] (a generous upper bound so a client
+///   always issues enough READ calls; the real length is signalled via EOF and,
+///   for `/index`, via [`magic_attr_sized`] in `getattr`).
+pub fn magic_attr(id: fileid3) -> fattr3 {
+    magic_attr_sized(id, MAGIC_FILE_SIZE)
 }
 
 /// Slice a precomputed byte buffer for an NFS READ, setting EOF at the end.
@@ -119,36 +131,68 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Registry of synthetic files seen via lookup/create: fileid -> decoded name.
+/// Registry of synthetic files seen via lookup/create: fileid -> decoded name,
+/// plus a per-fileid write buffer that composes positional NFS WRITE calls.
+///
 /// Process-local; the `/index` category is additionally rebuilt from the DB on
 /// `readdir` (see `dispatcher`), so its listing survives a restart even though
-/// this map itself does not.
+/// these maps themselves do not.
 #[derive(Default)]
 pub struct MagicRegistry {
-    inner: Mutex<HashMap<fileid3, String>>,
+    names: Mutex<HashMap<fileid3, String>>,
+    buffers: Mutex<HashMap<fileid3, Vec<u8>>>,
 }
 
 impl MagicRegistry {
     pub fn register(&self, id: fileid3, name: String) {
-        self.inner.lock().unwrap().entry(id).or_insert(name);
+        self.names.lock().unwrap().entry(id).or_insert(name);
     }
 
     pub fn get(&self, id: fileid3) -> Option<String> {
-        self.inner.lock().unwrap().get(&id).cloned()
+        self.names.lock().unwrap().get(&id).cloned()
     }
 
     pub fn forget(&self, id: fileid3) {
-        self.inner.lock().unwrap().remove(&id);
+        self.names.lock().unwrap().remove(&id);
+        self.buffers.lock().unwrap().remove(&id);
     }
 
     /// All (id, name) pairs whose category matches `cat`.
     pub fn list_for_cat(&self, cat: u8) -> Vec<(fileid3, String)> {
-        self.inner
+        self.names
             .lock()
             .unwrap()
             .iter()
             .filter(|(id, _)| magic_category(**id) == cat)
             .map(|(id, name)| (*id, name.clone()))
             .collect()
+    }
+
+    /// Whether an in-flight write buffer already exists for `id`.
+    pub fn has_buffer(&self, id: fileid3) -> bool {
+        self.buffers.lock().unwrap().contains_key(&id)
+    }
+
+    /// Seed the write buffer for `id` from existing persisted content, but only
+    /// if no buffer exists yet. Called before the first WRITE so positional
+    /// writes compose with what is already stored.
+    pub fn seed_buffer(&self, id: fileid3, data: Vec<u8>) {
+        let mut bufs = self.buffers.lock().unwrap();
+        bufs.entry(id).or_insert(data);
+    }
+
+    /// Splice `data` into the write buffer for `id` at `offset`, zero-filling
+    /// any gap, and return a clone of the resulting full buffer so the caller
+    /// can persist it. The buffer is created empty on first use.
+    pub fn write_into(&self, id: fileid3, offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut bufs = self.buffers.lock().unwrap();
+        let buf = bufs.entry(id).or_default();
+        let start = offset as usize;
+        let end = start + data.len();
+        if buf.len() < end {
+            buf.resize(end, 0u8);
+        }
+        buf[start..end].copy_from_slice(data);
+        buf.clone()
     }
 }

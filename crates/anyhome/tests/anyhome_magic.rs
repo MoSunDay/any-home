@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use nfsserve::nfs::{filename3, sattr3};
+use nfsserve::nfs::{filename3, nfsstat3, sattr3};
 use nfsserve::vfs::NFSFileSystem;
 use tempfile::tempdir;
 
@@ -95,13 +95,15 @@ async fn real_paths_still_work_alongside_magic() {
 }
 
 #[tokio::test]
-async fn writing_to_search_is_a_noop_but_does_not_error() {
+async fn writing_to_search_is_rejected_as_read_only() {
     let fs = make().await;
     let root = fs.root_dir();
     let search_dir = fs.lookup(root, &nm(b"search")).await.unwrap();
     let q_id = fs.lookup(search_dir, &nm(b"q")).await.unwrap();
-    // Writes to /search/* are ignored (only /index/* upserts).
-    fs.write(q_id, 0, b"ignored").await.unwrap();
+    // /search/* are read-only query views: writes are rejected (ROFS) rather
+    // than silently dropped.
+    let err = fs.write(q_id, 0, b"ignored").await.unwrap_err();
+    assert_eq!((err) as u32, nfsstat3::NFS3ERR_ROFS as u32);
 }
 
 // ---- /where full-text (TODO-09) and /index persistence (TODO-08) ----

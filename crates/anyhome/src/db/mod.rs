@@ -228,6 +228,28 @@ impl MemoryDb {
         Ok(out)
     }
 
+    /// All stored `(key, byte_size)` pairs, ordered by key. Used to render the
+    /// `/index` listing with accurate file sizes without a follow-up `getattr`
+    /// per entry. `length(CAST(text AS BLOB))` is the byte length of the text
+    /// (TEXT `length()` would count characters, not bytes).
+    pub async fn list_with_size(&self) -> Result<Vec<(String, u64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT key, length(CAST(text AS BLOB)) FROM memories ORDER BY key",
+                (),
+            )
+            .await
+            .context("list keys with size")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.context("fetch sized key row")? {
+            let key = row.get::<String>(0)?;
+            let sz = row.get::<i64>(1)? as u64;
+            out.push((key, sz));
+        }
+        Ok(out)
+    }
+
     /// The stored text for `key`, if present (lets `/index/<key>` be read back).
     pub async fn get_text(&self, key: &str) -> Result<Option<String>> {
         let mut rows = self
@@ -237,6 +259,16 @@ impl MemoryDb {
             .context("get text")?;
         let row = rows.next().await.context("fetch text row")?;
         Ok(row.map(|r| r.get::<String>(0).unwrap_or_default()))
+    }
+
+    /// Whether a memory exists under `key` (used by exclusive-create).
+    pub async fn exists(&self, key: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query("SELECT 1 FROM memories WHERE key = ? LIMIT 1", params![key])
+            .await
+            .context("exists check")?;
+        Ok(rows.next().await.context("fetch exists row")?.is_some())
     }
 
     /// Return up to `k` nearest memories `(key, text)`, ordered by ascending
