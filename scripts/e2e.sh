@@ -157,4 +157,42 @@ fi
 echo "==> ls /"
 ls -la "$MNT"
 
-echo "PASS: index -> search + where round-trip works over NFSv3"
+# ---- /agents/<id>/index -> /agents/<id>/search round-trip -------------------
+echo "==> /agents/botA/index/greeting <- 'agent A memory'"
+mkdir -p "$MNT/agents/botA/index"
+echo "agent A memory" > "$MNT/agents/botA/index/greeting"
+
+echo "==> /agents/botB/index/greeting <- 'agent B memory'"
+mkdir -p "$MNT/agents/botB/index"
+echo "agent B memory" > "$MNT/agents/botB/index/greeting"
+
+echo "==> ls /agents/"
+ls "$MNT/agents/"
+
+echo "==> asserting /agents/ lists botA and botB"
+if ! ls "$MNT/agents/" | grep -q "botA"; then
+    echo "FAIL: expected botA in /agents/ listing"; exit 1
+fi
+if ! ls "$MNT/agents/" | grep -q "botB"; then
+    echo "FAIL: expected botB in /agents/ listing"; exit 1
+fi
+
+# Agent A search should only see agent A's content.
+A_QUERY="$MNT/agents/botA/search/agent%20memory"
+echo "==> cat $A_QUERY"
+cat "$A_QUERY"
+echo "==> asserting agent A search returns 'agent A memory'"
+if ! grep -q "^greeting	agent A memory$" "$A_QUERY"; then
+    echo "FAIL: expected 'greeting<TAB>agent A memory' in agent A search"; exit 1
+fi
+
+# Agent B search should only see agent B's content.
+B_QUERY="$MNT/agents/botB/search/agent%20memory"
+echo "==> cat $B_QUERY"
+cat "$B_QUERY"
+echo "==> asserting agent B search returns 'agent B memory'"
+if ! grep -q "^greeting	agent B memory$" "$B_QUERY"; then
+    echo "FAIL: expected 'greeting<TAB>agent B memory' in agent B search"; exit 1
+fi
+
+echo "PASS: index -> search + where + agent namespace isolation works over NFSv3"

@@ -1,9 +1,18 @@
 //! The dispatcher: an [`NFSFileSystem`] that routes each call either to the
 //! real on-disk backend ([`RealFs`]) or to the DB layer via magic paths.
 //!
+//! ## Global magic paths (backward-compatible, default agent `agent_id = ""`)
 //! - `/search/<query>` — read returns KNN results for `<query>` as text.
 //! - `/index/<key>`    — write embeds and upserts the written text under `<key>`.
-//! - `/where/<cond>`   — read returns FTS5 full-text matches, or `key:<prefix>` key-filter.
+//! - `/where/<cond>`   — read returns FTS5 full-text matches, or `key:<prefix>`.
+//!
+//! ## Agent-scoped magic paths (multi-agent namespace isolation)
+//! - `/agents/<id>/search/<query>` — KNN scoped to agent `<id>`.
+//! - `/agents/<id>/index/<key>`    — write scoped to agent `<id>`.
+//! - `/agents/<id>/where/<cond>`   — FTS/prefix scoped to agent `<id>`.
+//!
+//! Agents are created implicitly on first write. `/agents` readdir lists known
+//! agents via `SELECT DISTINCT agent_id`.
 
 use std::sync::Arc;
 
@@ -15,8 +24,9 @@ use crate::backend::{RealFs, ROOT_ID};
 use crate::db::{Embedder, MemoryDb};
 use crate::magic::{
     percent_decode, slice_read, magic_attr, magic_attr_sized, magic_category, magic_file_id,
-    is_magic, is_magic_dir, MagicRegistry, CAT_INDEX, CAT_SEARCH, CAT_WHERE, DEFAULT_K,
-    INDEX_DIR, SEARCH_DIR, WHERE_DIR,
+    scoped_name, agent_dir_base_cat, is_magic, is_magic_dir, MagicEntry, MagicRegistry,
+    CAT_AGENT, CAT_INDEX, CAT_SEARCH, CAT_WHERE, DEFAULT_K,
+    INDEX_DIR, SEARCH_DIR, WHERE_DIR, AGENTS_DIR,
 };
 
 /// The dispatcher filesystem: real FS + DB, joined by magic paths.
@@ -37,8 +47,14 @@ impl AnyHomeFs {
         }
     }
 
-    /// Embed `query` and return up to [`DEFAULT_K`] KNN rows as `<id>\t<text>\n`.
-    async fn run_search(&self, query: &str) -> std::result::Result<Vec<u8>, nfsstat3> {
+    // ---- DB-backed operations (all scoped by agent_id) ----
+
+    /// Embed `query` and return up to [`DEFAULT_K`] KNN rows as `<key>\t<text>\n`.
+    async fn run_search(
+        &self,
+        agent_id: &str,
+        query: &str,
+    ) -> std::result::Result<Vec<u8>, nfsstat3> {
         let emb = self
             .embedder
             .embed(query)
@@ -46,7 +62,7 @@ impl AnyHomeFs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let rows = self
             .db
-            .search(&emb, DEFAULT_K)
+            .search(agent_id, &emb, DEFAULT_K)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let mut out = String::new();
@@ -56,24 +72,33 @@ impl AnyHomeFs {
         Ok(out.into_bytes())
     }
 
-    /// Embed `text` and upsert it under `key` (MVP: each write is an upsert).
-    async fn run_index(&self, key: &str, text: &str) -> std::result::Result<(), nfsstat3> {
+    /// Embed `text` and upsert it under `(agent_id, key)`.
+    async fn run_index(
+        &self,
+        agent_id: &str,
+        key: &str,
+        text: &str,
+    ) -> std::result::Result<(), nfsstat3> {
         let emb = self
             .embedder
             .embed(text)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         self.db
-            .upsert(key, text, &emb)
+            .upsert(agent_id, key, text, &emb)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)
     }
 
     /// Full-text / prefix query for `/where/<cond>` -> `<key>\t<text>\n` lines.
-    async fn run_where(&self, cond: &str) -> std::result::Result<Vec<u8>, nfsstat3> {
+    async fn run_where(
+        &self,
+        agent_id: &str,
+        cond: &str,
+    ) -> std::result::Result<Vec<u8>, nfsstat3> {
         let rows = self
             .db
-            .where_search(cond, DEFAULT_K)
+            .where_search(agent_id, cond, DEFAULT_K)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let mut out = String::new();
@@ -83,57 +108,95 @@ impl AnyHomeFs {
         Ok(out.into_bytes())
     }
 
-    /// Read back the stored text for an indexed key (so `/index/<key>` round-trips
-    /// and survives a restart, since the registry is rebuilt from the DB).
-    async fn index_text(&self, key: &str) -> std::result::Result<Vec<u8>, nfsstat3> {
-        match self.db.get_text(key).await {
+    /// Read back the stored text for an indexed key.
+    async fn index_text(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> std::result::Result<Vec<u8>, nfsstat3> {
+        match self.db.get_text(agent_id, key).await {
             Ok(Some(text)) => Ok(text.into_bytes()),
             Ok(None) => Ok(format!("# no indexed memory under key: {}\n", key).into_bytes()),
             Err(_) => Err(nfsstat3::NFS3ERR_IO),
         }
     }
 
-    /// Resolve the decoded name for an `/index` fileid, recovering it from the
-    /// DB when the in-memory registry has no entry (e.g. after a restart, before
-    /// the client re-`lookup`s). The recovered name is cached so later calls are
-    /// O(1). `/search`/`/where` names are the query itself with no DB backing, so
-    /// they cannot be recovered this way (they require a fresh `lookup`, which is
-    /// standard NFS reconnect behavior).
-    async fn index_name_for(&self, id: fileid3) -> Option<String> {
-        if let Some(name) = self.magic.get(id) {
-            return Some(name);
+    // ---- Routing helpers ----
+
+    /// Resolve the base file category for a magic directory (global or
+    /// agent-scoped). Returns `None` if `dirid` is not a magic dir that
+    /// contains magic files.
+    fn dir_category(&self, dirid: fileid3) -> Option<u8> {
+        match dirid {
+            SEARCH_DIR => Some(CAT_SEARCH),
+            INDEX_DIR => Some(CAT_INDEX),
+            WHERE_DIR => Some(CAT_WHERE),
+            _ => agent_dir_base_cat(magic_category(dirid)),
         }
-        let keys = self.db.list_keys().await.ok()?;
+    }
+
+    /// The agent_id that a magic directory belongs to. Global magic dirs
+    /// return `""`; agent-scoped dirs look up the registry (which is populated
+    /// by `lookup` before any operation).
+    fn agent_id_of_dir(&self, dirid: fileid3) -> String {
+        if matches!(dirid, SEARCH_DIR | INDEX_DIR | WHERE_DIR) {
+            return String::new();
+        }
+        self.magic
+            .get_entry(dirid)
+            .map(|e| e.agent_id)
+            .unwrap_or_default()
+    }
+
+    /// Parent directory for `..` lookups in the magic namespace.
+    fn magic_parent_of(&self, id: fileid3) -> fileid3 {
+        if matches!(id, SEARCH_DIR | INDEX_DIR | WHERE_DIR | AGENTS_DIR) {
+            return ROOT_ID;
+        }
+        match magic_category(id) {
+            CAT_AGENT => AGENTS_DIR,
+            c if agent_dir_base_cat(c).is_some() => self
+                .magic
+                .get_entry(id)
+                .map(|e| magic_file_id(CAT_AGENT, &e.agent_id))
+                .unwrap_or(AGENTS_DIR),
+            _ => ROOT_ID,
+        }
+    }
+
+    /// Recover `(agent_id, key)` from an index fileid. Tries the registry
+    /// first; falls back to scanning the default agent's keys (for restart
+    /// recovery of global `/index` files).
+    async fn index_name_for(&self, id: fileid3) -> Option<(String, String)> {
+        if let Some(entry) = self.magic.get_entry(id) {
+            return Some((entry.agent_id, entry.name));
+        }
+        // Fallback: default agent only (agent-scoped files need a fresh lookup).
+        let keys = self.db.list_keys("").await.ok()?;
         for key in keys {
             if magic_file_id(CAT_INDEX, &key) == id {
-                self.magic.register(id, key.clone());
-                return Some(key);
+                self.magic
+                    .register(id, MagicEntry::new("", &key, CAT_INDEX));
+                return Some((String::new(), key));
             }
         }
         None
     }
 
-    /// Attributes for an `/index` file reflecting its real stored byte size.
+    /// Attributes with the real content byte size for an index file.
     async fn index_attr(&self, id: fileid3) -> fattr3 {
         let size = match self.index_name_for(id).await {
-            Some(key) => self
+            Some((agent_id, key)) => self
                 .db
-                .get_text(&key)
+                .get_text(&agent_id, &key)
                 .await
-                .map(|t| t.map(|s| s.len() as u64).unwrap_or(0))
+                .ok()
+                .flatten()
+                .map(|t| t.len() as u64)
                 .unwrap_or(0),
             None => 0,
         };
         magic_attr_sized(id, size)
-    }
-}
-
-fn dir_category(dirid: fileid3) -> Option<u8> {
-    match dirid {
-        SEARCH_DIR => Some(CAT_SEARCH),
-        INDEX_DIR => Some(CAT_INDEX),
-        WHERE_DIR => Some(CAT_WHERE),
-        _ => None,
     }
 }
 
@@ -152,39 +215,74 @@ impl NFSFileSystem for AnyHomeFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> std::result::Result<fileid3, nfsstat3> {
-        if dirid == ROOT_ID {
-            match filename.as_slice() {
-                b"search" => return Ok(SEARCH_DIR),
-                b"index" => return Ok(INDEX_DIR),
-                b"where" => return Ok(WHERE_DIR),
-                _ => {}
-            }
-        }
         if filename.as_slice() == b"." {
             return Ok(dirid);
         }
         if filename.as_slice() == b".." {
             return Ok(if is_magic(dirid) {
-                ROOT_ID
+                self.magic_parent_of(dirid)
             } else {
                 self.real.lookup(dirid, &b"..".to_vec().into()).await?
             });
         }
-        if let Some(cat) = dir_category(dirid) {
-            let name = percent_decode(filename);
-            let id = magic_file_id(cat, &name);
-            self.magic.register(id, name);
+
+        // Root level: global magic dirs + /agents.
+        if dirid == ROOT_ID {
+            match filename.as_slice() {
+                b"search" => return Ok(SEARCH_DIR),
+                b"index" => return Ok(INDEX_DIR),
+                b"where" => return Ok(WHERE_DIR),
+                b"agents" => return Ok(AGENTS_DIR),
+                _ => {}
+            }
+        }
+
+        // /agents level: any name becomes an agent container dir.
+        if dirid == AGENTS_DIR {
+            let agent_id = percent_decode(filename);
+            let id = magic_file_id(CAT_AGENT, &agent_id);
+            self.magic
+                .register(id, MagicEntry::new(&agent_id, &agent_id, CAT_AGENT));
             return Ok(id);
         }
+
+        // /agents/<id> level: only search/index/where subdirs.
+        if is_magic(dirid) && magic_category(dirid) == CAT_AGENT {
+            let agent_id = self
+                .magic
+                .get_entry(dirid)
+                .map(|e| e.agent_id)
+                .unwrap_or_default();
+            let (sub, cat) = match filename.as_slice() {
+                b"search" => ("search", crate::magic::CAT_AGENT_SEARCH),
+                b"index" => ("index", crate::magic::CAT_AGENT_INDEX),
+                b"where" => ("where", crate::magic::CAT_AGENT_WHERE),
+                _ => return Err(nfsstat3::NFS3ERR_NOENT),
+            };
+            let scoped = scoped_name(&agent_id, sub);
+            let id = magic_file_id(cat, &scoped);
+            self.magic
+                .register(id, MagicEntry::new(&agent_id, sub, cat));
+            return Ok(id);
+        }
+
+        // Magic dir file lookup (global + agent-scoped).
+        if let Some(cat) = self.dir_category(dirid) {
+            let name = percent_decode(filename);
+            let agent_id = self.agent_id_of_dir(dirid);
+            let scoped = scoped_name(&agent_id, &name);
+            let id = magic_file_id(cat, &scoped);
+            self.magic
+                .register(id, MagicEntry::new(&agent_id, &name, cat));
+            return Ok(id);
+        }
+
         self.real.lookup(dirid, filename).await
     }
 
     async fn getattr(&self, id: fileid3) -> std::result::Result<fattr3, nfsstat3> {
         if is_magic(id) {
             if !is_magic_dir(id) && magic_category(id) == CAT_INDEX {
-                // `/index` files report their real byte size so `stat`/`ls -l`
-                // match the content read back. `/search` and `/where` are
-                // dynamic per query and keep the virtual ceiling (magic_attr).
                 return Ok(self.index_attr(id).await);
             }
             return Ok(magic_attr(id));
@@ -198,10 +296,6 @@ impl NFSFileSystem for AnyHomeFs {
         setattr: sattr3,
     ) -> std::result::Result<fattr3, nfsstat3> {
         if is_magic(id) {
-            // `/search` and `/where` are read-only query views: mutating their
-            // attributes is rejected (ROFS) rather than silently ignored.
-            // `/index` accepts (ignores) setattr for clients that chmod/truncate
-            // before writing, and reports its real size.
             if !is_magic_dir(id) {
                 match magic_category(id) {
                     CAT_SEARCH | CAT_WHERE => return Err(nfsstat3::NFS3ERR_ROFS),
@@ -225,15 +319,20 @@ impl NFSFileSystem for AnyHomeFs {
                 return Err(nfsstat3::NFS3ERR_ISDIR);
             }
             let cat = magic_category(id);
-            let name = match cat {
-                // `/index` names are recoverable from the DB on a registry miss.
-                CAT_INDEX => self.index_name_for(id).await.ok_or(nfsstat3::NFS3ERR_NOENT)?,
-                _ => self.magic.get(id).ok_or(nfsstat3::NFS3ERR_NOENT)?,
+            let entry = match cat {
+                CAT_INDEX => {
+                    let (aid, name) = self
+                        .index_name_for(id)
+                        .await
+                        .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+                    MagicEntry::new(&aid, &name, CAT_INDEX)
+                }
+                _ => self.magic.get_entry(id).ok_or(nfsstat3::NFS3ERR_NOENT)?,
             };
             let content = match cat {
-                CAT_SEARCH => self.run_search(&name).await?,
-                CAT_WHERE => self.run_where(&name).await?,
-                CAT_INDEX => self.index_text(&name).await?,
+                CAT_SEARCH => self.run_search(&entry.agent_id, &entry.name).await?,
+                CAT_WHERE => self.run_where(&entry.agent_id, &entry.name).await?,
+                CAT_INDEX => self.index_text(&entry.agent_id, &entry.name).await?,
                 _ => Vec::new(),
             };
             return Ok(slice_read(&content, offset, count));
@@ -253,25 +352,20 @@ impl NFSFileSystem for AnyHomeFs {
             }
             match magic_category(id) {
                 CAT_INDEX => {
-                    let key = self.index_name_for(id).await.ok_or(nfsstat3::NFS3ERR_NOENT)?;
-                    // Compose positional WRITEs into one buffer: a single `echo`
-                    // or large `cp` arrives as multiple chunks at increasing
-                    // offsets, which would otherwise overwrite each other. Seed
-                    // from the DB on the first write so writes compose with the
-                    // existing content.
+                    let (agent_id, key) = self
+                        .index_name_for(id)
+                        .await
+                        .ok_or(nfsstat3::NFS3ERR_NOENT)?;
                     if !self.magic.has_buffer(id) {
-                        if let Ok(Some(existing)) = self.db.get_text(&key).await {
+                        if let Ok(Some(existing)) = self.db.get_text(&agent_id, &key).await {
                             self.magic.seed_buffer(id, existing.into_bytes());
                         }
                     }
                     let full = self.magic.write_into(id, offset, data);
-                    // The DB `text` column requires valid UTF-8: reject rather
-                    // than silently corrupt via lossy replacement.
                     let text = String::from_utf8(full).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-                    self.run_index(&key, &text).await?;
+                    self.run_index(&agent_id, &key, &text).await?;
                     return Ok(self.index_attr(id).await);
                 }
-                // `/search` and `/where` are read-only query views.
                 CAT_SEARCH | CAT_WHERE => return Err(nfsstat3::NFS3ERR_ROFS),
                 _ => return Ok(magic_attr(id)),
             }
@@ -285,10 +379,13 @@ impl NFSFileSystem for AnyHomeFs {
         filename: &filename3,
         attr: sattr3,
     ) -> std::result::Result<(fileid3, fattr3), nfsstat3> {
-        if let Some(cat) = dir_category(dirid) {
+        if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
-            let id = magic_file_id(cat, &name);
-            self.magic.register(id, name);
+            let agent_id = self.agent_id_of_dir(dirid);
+            let scoped = scoped_name(&agent_id, &name);
+            let id = magic_file_id(cat, &scoped);
+            self.magic
+                .register(id, MagicEntry::new(&agent_id, &name, cat));
             return Ok((id, magic_attr(id)));
         }
         self.real.create(dirid, filename, attr).await
@@ -299,20 +396,20 @@ impl NFSFileSystem for AnyHomeFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> std::result::Result<fileid3, nfsstat3> {
-        if let Some(cat) = dir_category(dirid) {
+        if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
-            let id = magic_file_id(cat, &name);
-            // Honor the exclusive (O_EXCL) contract: fail if the target already
-            // exists. `/index` checks the durable DB; the query views check the
-            // in-memory registry.
+            let agent_id = self.agent_id_of_dir(dirid);
+            let scoped = scoped_name(&agent_id, &name);
+            let id = magic_file_id(cat, &scoped);
             let exists = match cat {
-                CAT_INDEX => self.db.exists(&name).await.unwrap_or(false),
-                _ => self.magic.get(id).is_some(),
+                CAT_INDEX => self.db.exists(&agent_id, &name).await.unwrap_or(false),
+                _ => self.magic.get_entry(id).is_some(),
             };
             if exists {
                 return Err(nfsstat3::NFS3ERR_EXIST);
             }
-            self.magic.register(id, name);
+            self.magic
+                .register(id, MagicEntry::new(&agent_id, &name, cat));
             return Ok(id);
         }
         self.real.create_exclusive(dirid, filename).await
@@ -334,11 +431,13 @@ impl NFSFileSystem for AnyHomeFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> std::result::Result<(), nfsstat3> {
-        if let Some(cat) = dir_category(dirid) {
+        if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
-            let id = magic_file_id(cat, &name);
+            let agent_id = self.agent_id_of_dir(dirid);
+            let scoped = scoped_name(&agent_id, &name);
+            let id = magic_file_id(cat, &scoped);
             if cat == CAT_INDEX {
-                let _ = self.db.delete(&name).await;
+                let _ = self.db.delete(&agent_id, &name).await;
             }
             self.magic.forget(id);
             return Ok(());
@@ -387,21 +486,80 @@ impl NFSFileSystem for AnyHomeFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
-        if let Some(cat) = dir_category(dirid) {
-            // `/index` is durable storage: rebuild its listing from the DB with
-            // real byte sizes so a restart (which clears the in-memory registry)
-            // still shows history with accurate attributes.
+        // /agents: list known agent directories from the DB.
+        if dirid == AGENTS_DIR {
+            let agents = self.db.list_agents().await.unwrap_or_default();
+            let mut entries: Vec<DirEntry> = agents
+                .into_iter()
+                .map(|agent_id| {
+                    let id = magic_file_id(CAT_AGENT, &agent_id);
+                    self.magic
+                        .register(id, MagicEntry::new(&agent_id, &agent_id, CAT_AGENT));
+                    DirEntry {
+                        fileid: id,
+                        name: agent_id.into_bytes().into(),
+                        attr: magic_attr(id),
+                    }
+                })
+                .collect();
+            entries.sort_by_key(|e| e.fileid);
+            entries.retain(|e| e.fileid > start_after);
+            let end = entries.len() <= max_entries;
+            entries.truncate(max_entries);
+            return Ok(ReadDirResult { entries, end });
+        }
+
+        // /agents/<id>: fixed listing of search/ index/ where/.
+        if is_magic(dirid) && magic_category(dirid) == CAT_AGENT {
+            let agent_id = self
+                .magic
+                .get_entry(dirid)
+                .map(|e| e.agent_id)
+                .unwrap_or_default();
+            let subdirs: [(&str, u8); 3] = [
+                ("search", crate::magic::CAT_AGENT_SEARCH),
+                ("index", crate::magic::CAT_AGENT_INDEX),
+                ("where", crate::magic::CAT_AGENT_WHERE),
+            ];
+            let mut entries: Vec<DirEntry> = subdirs
+                .iter()
+                .map(|(name, cat)| {
+                    let scoped = scoped_name(&agent_id, name);
+                    let id = magic_file_id(*cat, &scoped);
+                    self.magic
+                        .register(id, MagicEntry::new(&agent_id, name, *cat));
+                    DirEntry {
+                        fileid: id,
+                        name: name.as_bytes().to_vec().into(),
+                        attr: magic_attr(id),
+                    }
+                })
+                .collect();
+            entries.sort_by_key(|e| e.fileid);
+            entries.retain(|e| e.fileid > start_after);
+            let end = entries.len() <= max_entries;
+            entries.truncate(max_entries);
+            return Ok(ReadDirResult { entries, end });
+        }
+
+        // Magic dirs with files (global + agent-scoped).
+        if let Some(cat) = self.dir_category(dirid) {
+            let agent_id = self.agent_id_of_dir(dirid);
             if cat == CAT_INDEX {
                 let mut sized: Vec<(fileid3, String, u64)> = self
                     .db
-                    .list_with_size()
+                    .list_with_size(&agent_id)
                     .await
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(key, sz)| (magic_file_id(CAT_INDEX, &key), key, sz))
+                    .map(|(key, sz)| {
+                        let scoped = scoped_name(&agent_id, &key);
+                        (magic_file_id(CAT_INDEX, &scoped), key, sz)
+                    })
                     .collect();
                 for (id, key, _) in &sized {
-                    self.magic.register(*id, key.clone());
+                    self.magic
+                        .register(*id, MagicEntry::new(&agent_id, key, CAT_INDEX));
                 }
                 sized.sort_by_key(|(id, _, _)| *id);
                 let mut entries: Vec<DirEntry> = sized
@@ -417,8 +575,8 @@ impl NFSFileSystem for AnyHomeFs {
                 entries.truncate(max_entries);
                 return Ok(ReadDirResult { entries, end });
             }
-            // `/search`, `/where`: in-memory registry listing (virtual sizes).
-            let mut rows = self.magic.list_for_cat(cat);
+            // /search, /where: in-memory registry listing (virtual sizes).
+            let mut rows = self.magic.list_for_cat(cat, &agent_id);
             rows.sort_by_key(|(id, _)| *id);
             let mut entries: Vec<DirEntry> = rows
                 .into_iter()
@@ -434,13 +592,14 @@ impl NFSFileSystem for AnyHomeFs {
             return Ok(ReadDirResult { entries, end });
         }
 
-        // Root: real entries first, then the three magic dirs (ids sort last).
+        // Root: real entries first, then the magic dirs (including /agents).
         let mut res = self.real.readdir(dirid, start_after, max_entries).await?;
         if dirid == ROOT_ID && res.end {
             for (id, name) in [
                 (SEARCH_DIR, b"search".as_slice()),
                 (INDEX_DIR, b"index".as_slice()),
                 (WHERE_DIR, b"where".as_slice()),
+                (AGENTS_DIR, b"agents".as_slice()),
             ] {
                 if id <= start_after {
                     continue;

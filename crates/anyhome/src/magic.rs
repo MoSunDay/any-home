@@ -4,9 +4,16 @@
 //! See [`crate::dispatcher`] for the routing semantics. fileid layout:
 //! ```text
 //! bit 63       : MAGIC flag (1 => synthetic)
-//! bits 56..59  : category (0 = dir, 1/2/3 = search/index/where file)
-//! bits  0..55  : FNV-1a hash of the decoded name
+//! bits 56..59  : category (0 = dir, 1/2/3 = search/index/where file,
+//!                7 = agent container dir, 8/9/10 = agent-scoped search/index/where dir)
+//! bits  0..55  : FNV-1a hash of the decoded (possibly scoped) name
 //! ```
+//!
+//! Multi-agent isolation: fileids for agent-scoped files are computed from a
+//! *scoped name* — `"{agent_id}\0{name}"` — so the same `name` in two different
+//! agents produces different fileids (no cross-agent collision). The
+//! [`MagicRegistry`] stores the full [`MagicEntry`] (agent_id + name + category)
+//! so the dispatcher can recover the agent context from any magic fileid.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,15 +24,22 @@ pub const MAGIC: u64 = 1u64 << 63;
 const CAT_SHIFT: u32 = 56;
 const HASH_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF; // low 56 bits
 
-// Magic directory ids (category 0, fixed small hashes).
+// Magic directory ids (category field 0, fixed small hashes).
 pub const SEARCH_DIR: fileid3 = MAGIC | 0x1;
 pub const INDEX_DIR: fileid3 = MAGIC | 0x2;
 pub const WHERE_DIR: fileid3 = MAGIC | 0x3;
+pub const AGENTS_DIR: fileid3 = MAGIC | 0x4;
 
 // File categories.
 pub const CAT_SEARCH: u8 = 1;
 pub const CAT_INDEX: u8 = 2;
 pub const CAT_WHERE: u8 = 3;
+
+// Agent namespace categories (>= CAT_AGENT are always directories).
+pub const CAT_AGENT: u8 = 7;
+pub const CAT_AGENT_SEARCH: u8 = 8;
+pub const CAT_AGENT_INDEX: u8 = 9;
+pub const CAT_AGENT_WHERE: u8 = 10;
 
 /// Default number of neighbors returned by `/search`.
 pub const DEFAULT_K: i64 = 16;
@@ -36,17 +50,39 @@ pub fn is_magic(id: fileid3) -> bool {
     id & MAGIC != 0
 }
 
+/// True for any synthetic directory: global magic dirs, `/agents`, and all
+/// agent-scoped container/magic dirs (categories >= CAT_AGENT).
 pub fn is_magic_dir(id: fileid3) -> bool {
-    matches!(id, SEARCH_DIR | INDEX_DIR | WHERE_DIR)
+    if matches!(id, SEARCH_DIR | INDEX_DIR | WHERE_DIR | AGENTS_DIR) {
+        return true;
+    }
+    is_magic(id) && magic_category(id) >= CAT_AGENT
 }
 
 pub fn magic_category(id: fileid3) -> u8 {
     ((id >> CAT_SHIFT) & 0xF) as u8
 }
 
-pub fn magic_file_id(cat: u8, name: &str) -> fileid3 {
-    let h = fnv1a_64(name.as_bytes()) & HASH_MASK;
+/// Compute the scoped name used for fileid hashing: `"{agent_id}\0{name}"`.
+/// The NUL separator avoids boundary ambiguity between agent_id and name.
+pub fn scoped_name(agent_id: &str, name: &str) -> String {
+    format!("{agent_id}\x00{name}")
+}
+
+pub fn magic_file_id(cat: u8, scoped_name: &str) -> fileid3 {
+    let h = fnv1a_64(scoped_name.as_bytes()) & HASH_MASK;
     MAGIC | ((cat as u64) << CAT_SHIFT) | h
+}
+
+/// Map an agent-scoped dir category to its base file category, or `None` if
+/// `cat` is not an agent-scoped dir.
+pub fn agent_dir_base_cat(cat: u8) -> Option<u8> {
+    match cat {
+        CAT_AGENT_SEARCH => Some(CAT_SEARCH),
+        CAT_AGENT_INDEX => Some(CAT_INDEX),
+        CAT_AGENT_WHERE => Some(CAT_WHERE),
+        _ => None,
+    }
 }
 
 pub fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -84,11 +120,6 @@ pub fn magic_attr_sized(id: fileid3, size: u64) -> fattr3 {
 }
 
 /// Synthetic attributes with the default virtual size.
-///
-/// - directories: 4096
-/// - regular files: [`MAGIC_FILE_SIZE`] (a generous upper bound so a client
-///   always issues enough READ calls; the real length is signalled via EOF and,
-///   for `/index`, via [`magic_attr_sized`] in `getattr`).
 pub fn magic_attr(id: fileid3) -> fattr3 {
     magic_attr_sized(id, MAGIC_FILE_SIZE)
 }
@@ -131,40 +162,63 @@ fn hex_val(c: u8) -> Option<u8> {
     }
 }
 
-/// Registry of synthetic files seen via lookup/create: fileid -> decoded name,
-/// plus a per-fileid write buffer that composes positional NFS WRITE calls.
-///
-/// Process-local; the `/index` category is additionally rebuilt from the DB on
-/// `readdir` (see `dispatcher`), so its listing survives a restart even though
-/// these maps themselves do not.
+/// Full context for a magic fileid: which agent it belongs to, its decoded
+/// name, and its category. Stored in [`MagicRegistry`].
+#[derive(Clone, Debug)]
+pub struct MagicEntry {
+    pub agent_id: String,
+    pub name: String,
+    pub category: u8,
+}
+
+impl MagicEntry {
+    pub fn new(agent_id: &str, name: &str, category: u8) -> Self {
+        MagicEntry {
+            agent_id: agent_id.to_string(),
+            name: name.to_string(),
+            category,
+        }
+    }
+}
+
+/// Process-local registry mapping synthetic fileids to their decoded context
+/// ([`MagicEntry`]) and write buffers. Populated lazily by `lookup`/`create`
+/// and rebuilt from the DB on restart (NFS clients always re-`lookup` after a
+/// reconnect).
 #[derive(Default)]
 pub struct MagicRegistry {
-    names: Mutex<HashMap<fileid3, String>>,
+    entries: Mutex<HashMap<fileid3, MagicEntry>>,
     buffers: Mutex<HashMap<fileid3, Vec<u8>>>,
 }
 
 impl MagicRegistry {
-    pub fn register(&self, id: fileid3, name: String) {
-        self.names.lock().unwrap().entry(id).or_insert(name);
+    pub fn register(&self, id: fileid3, entry: MagicEntry) {
+        self.entries.lock().unwrap().entry(id).or_insert(entry);
     }
 
+    pub fn get_entry(&self, id: fileid3) -> Option<MagicEntry> {
+        self.entries.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Convenience: just the decoded name (for backwards-compatible callers).
     pub fn get(&self, id: fileid3) -> Option<String> {
-        self.names.lock().unwrap().get(&id).cloned()
+        self.entries.lock().unwrap().get(&id).map(|e| e.name.clone())
     }
 
     pub fn forget(&self, id: fileid3) {
-        self.names.lock().unwrap().remove(&id);
+        self.entries.lock().unwrap().remove(&id);
         self.buffers.lock().unwrap().remove(&id);
     }
 
-    /// All (id, name) pairs whose category matches `cat`.
-    pub fn list_for_cat(&self, cat: u8) -> Vec<(fileid3, String)> {
-        self.names
+    /// All `(id, name)` pairs whose category matches `cat` **and** whose
+    /// agent_id matches `agent_id`. Used by readdir for `/search` and `/where`.
+    pub fn list_for_cat(&self, cat: u8, agent_id: &str) -> Vec<(fileid3, String)> {
+        self.entries
             .lock()
             .unwrap()
             .iter()
-            .filter(|(id, _)| magic_category(**id) == cat)
-            .map(|(id, name)| (*id, name.clone()))
+            .filter(|(id, e)| magic_category(**id) == cat && e.agent_id == agent_id)
+            .map(|(id, e)| (*id, e.name.clone()))
             .collect()
     }
 
@@ -174,16 +228,14 @@ impl MagicRegistry {
     }
 
     /// Seed the write buffer for `id` from existing persisted content, but only
-    /// if no buffer exists yet. Called before the first WRITE so positional
-    /// writes compose with what is already stored.
+    /// if no buffer exists yet.
     pub fn seed_buffer(&self, id: fileid3, data: Vec<u8>) {
         let mut bufs = self.buffers.lock().unwrap();
         bufs.entry(id).or_insert(data);
     }
 
     /// Splice `data` into the write buffer for `id` at `offset`, zero-filling
-    /// any gap, and return a clone of the resulting full buffer so the caller
-    /// can persist it. The buffer is created empty on first use.
+    /// any gap, and return a clone of the resulting full buffer.
     pub fn write_into(&self, id: fileid3, offset: u64, data: &[u8]) -> Vec<u8> {
         let mut bufs = self.buffers.lock().unwrap();
         let buf = bufs.entry(id).or_default();

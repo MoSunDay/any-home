@@ -1,15 +1,21 @@
 //! Vector-backed memory store built on embedded libSQL (core-only).
 //!
-//! Each memory is a `(key, text, embedding)` row. Search is KNN over the vector
-//! index; `/where` is full-text over an FTS5 shadow table kept in sync by
-//! triggers. A single [`libsql::Connection`] is shared (it is `Clone` and backed
-//! by an `Arc`, with SQLite compiled in SERIALIZED mode), so no `Mutex` is
-//! needed.
+//! Each memory is an `(agent_id, key, text, embedding)` row. Search is KNN over
+//! the vector index; `/where` is full-text over an FTS5 shadow table kept in
+//! sync by triggers. A single [`libsql::Connection`] is shared (it is `Clone`
+//! and backed by an `Arc`, with SQLite compiled in SERIALIZED mode), so no
+//! `Mutex` is needed.
 //!
-//! Persistence (TODO-08): the embedding dimension is recorded in a `meta` table
-//! on first open and validated on every reopen, so a stale DB file can never be
-//! silently reopened with a mismatched embedder. `list_keys` lets the `/index`
-//! directory rebuild its listing from the DB after a restart.
+//! Multi-agent namespace isolation (TODO-21..25): every row carries an
+//! `agent_id` that scopes all queries. The global magic paths (`/search`,
+//! `/index`, `/where`) operate on the default agent (`agent_id = ""`), while
+//! `/agents/<id>/...` paths scope their operations to the named agent.
+//! `list_agents()` enumerates known non-default agents for directory listings.
+//!
+//! Persistence: the embedding dimension is recorded in a `meta` table on first
+//! open and validated on every reopen. A `schema_version` key in the same table
+//! drives idempotent migrations (v0 -> v1 adds the `agent_id` column and
+//! changes the unique constraint from `key` to `(agent_id, key)`).
 
 pub mod embedder;
 #[cfg(feature = "embed-fastembed")]
@@ -19,6 +25,9 @@ use anyhow::{anyhow, Context, Result};
 use libsql::{params, Builder, Connection, Row};
 
 pub use embedder::{dummy_embed, DummyEmbedder, Embedder, DUMMY_DIM};
+
+/// Current schema version understood by this code.
+const SCHEMA_VERSION: i64 = 1;
 
 /// A vector memory store. Cheap to clone (shares one SQLite connection).
 #[derive(Clone)]
@@ -40,6 +49,7 @@ impl MemoryDb {
         let conn = db.connect().context("connect libsql database")?;
         let store = MemoryDb { conn, dim };
         store.init_schema().await?;
+        store.migrate_schema().await?;
         store.reconcile_dim().await?;
         store.ensure_fts_populated().await?;
         Ok(store)
@@ -55,9 +65,11 @@ impl MemoryDb {
         let create_table = format!(
             "CREATE TABLE IF NOT EXISTS memories(\
                id INTEGER PRIMARY KEY,\
-               key TEXT UNIQUE,\
+               agent_id TEXT NOT NULL DEFAULT '',\
+               key TEXT NOT NULL,\
                text TEXT,\
-               emb FLOAT32({dim})\
+               emb FLOAT32({dim}),\
+               UNIQUE(agent_id, key)\
              )",
             dim = self.dim
         );
@@ -94,6 +106,15 @@ impl MemoryDb {
             )
             .await
             .context("create memories_fts virtual table")?;
+        self.create_fts_triggers().await?;
+        Ok(())
+    }
+
+    /// Recreate the three FTS5 sync triggers on `memories`. Called both during
+    /// initial schema creation and after a table-rebuild migration (DROP TABLE
+    /// removes triggers). Uses `CREATE TRIGGER IF NOT EXISTS` so it is safe to
+    /// call redundantly.
+    async fn create_fts_triggers(&self) -> Result<()> {
         self.conn
             .execute(
                 "CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN \
@@ -124,6 +145,110 @@ impl MemoryDb {
             )
             .await
             .context("create memories_au trigger")?;
+        Ok(())
+    }
+
+    /// Read the recorded schema version from `meta` (0 if not yet set).
+    async fn schema_version(&self) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = 'schema_version'", ())
+            .await
+            .context("read schema version")?;
+        let row = rows.next().await.context("fetch schema_version row")?;
+        drop(rows);
+        match row {
+            None => Ok(0),
+            Some(r) => Ok(r.get::<String>(0)?.parse().unwrap_or(0)),
+        }
+    }
+
+    /// Persist the schema version stamp.
+    async fn set_schema_version(&self, v: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![v.to_string()],
+            )
+            .await
+            .context("record schema version")?;
+        Ok(())
+    }
+
+    /// Check whether column `col` exists on `table`.
+    async fn has_column(&self, table: &str, col: &str) -> Result<bool> {
+        // `table` and `col` are fixed internal identifiers, never user input.
+        let sql = format!("PRAGMA table_info({table})");
+        let mut rows = self.conn.query(&sql, ()).await.context("pragma table_info")?;
+        while let Some(row) = rows.next().await.context("fetch pragma row")? {
+            // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+            let name: String = row.get::<String>(1).unwrap_or_default();
+            if name == col {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Idempotent migration from older schema versions to [`SCHEMA_VERSION`].
+    ///
+    /// v0 -> v1: adds the `agent_id` column and changes the unique constraint
+    /// from `key` (column-level) to `(agent_id, key)` (table-level). Since
+    /// SQLite cannot ALTER a column constraint, this is done via the standard
+    /// table-rebuild pattern: create new table → copy data → drop old → rename
+    /// → recreate vector index + FTS triggers.
+    async fn migrate_schema(&self) -> Result<()> {
+        let version = self.schema_version().await?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        if !self.has_column("memories", "agent_id").await? {
+            // v0 table has `key TEXT UNIQUE` but no `agent_id`. Rebuild to the
+            // current schema, preserving all existing rows with agent_id = ''.
+            let create = format!(
+                "CREATE TABLE memories_new(\
+                   id INTEGER PRIMARY KEY,\
+                   agent_id TEXT NOT NULL DEFAULT '',\
+                   key TEXT NOT NULL,\
+                   text TEXT,\
+                   emb FLOAT32({dim}),\
+                   UNIQUE(agent_id, key)\
+                 )",
+                dim = self.dim
+            );
+            self.conn.execute(&create, ()).await.context("create memories_new")?;
+            self.conn
+                .execute(
+                    "INSERT INTO memories_new(id, agent_id, key, text, emb) \
+                     SELECT id, '', key, text, emb FROM memories",
+                    (),
+                )
+                .await
+                .context("copy memories data during migration")?;
+            self.conn.execute("DROP TABLE memories", ()).await.context("drop old memories")?;
+            self.conn
+                .execute("ALTER TABLE memories_new RENAME TO memories", ())
+                .await
+                .context("rename memories_new")?;
+            // Recreate vector index (not carried over by the rebuild).
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS memories_vec_idx \
+                     ON memories ( libsql_vector_idx(emb) )",
+                    (),
+                )
+                .await
+                .context("recreate vector index after migration")?;
+            // Recreate FTS5 triggers (DROP TABLE removed them).
+            self.create_fts_triggers().await?;
+            // Rebuild FTS index to ensure rowid consistency.
+            self.conn
+                .execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", ())
+                .await
+                .context("rebuild fts after migration")?;
+        }
+        self.set_schema_version(SCHEMA_VERSION).await?;
         Ok(())
     }
 
@@ -190,35 +315,61 @@ impl MemoryDb {
         Ok(row.get::<i64>(0)?)
     }
 
-    /// Insert or replace the memory under `key`.
-    pub async fn upsert(&self, key: &str, text: &str, emb: &[f32]) -> Result<()> {
+    /// Insert or replace the memory under `(agent_id, key)`.
+    pub async fn upsert(&self, agent_id: &str, key: &str, text: &str, emb: &[f32]) -> Result<()> {
         let json = vec_to_json(emb);
         self.conn
             .execute(
-                "INSERT INTO memories(key, text, emb) \
-                 VALUES (?, ?, vector(?)) \
-                 ON CONFLICT(key) DO UPDATE SET text = excluded.text, emb = excluded.emb",
-                params![key, text, json],
+                "INSERT INTO memories(agent_id, key, text, emb) \
+                 VALUES (?, ?, ?, vector(?)) \
+                 ON CONFLICT(agent_id, key) DO UPDATE SET \
+                     text = excluded.text, emb = excluded.emb",
+                params![agent_id, key, text, json],
             )
             .await
             .map(|_| ())
             .context("upsert memory")
     }
 
-    /// Remove the memory under `key` (no error if absent).
-    pub async fn delete(&self, key: &str) -> Result<()> {
+    /// Remove the memory under `(agent_id, key)` (no error if absent).
+    pub async fn delete(&self, agent_id: &str, key: &str) -> Result<()> {
         self.conn
-            .execute("DELETE FROM memories WHERE key = ?", params![key])
+            .execute(
+                "DELETE FROM memories WHERE agent_id = ? AND key = ?",
+                params![agent_id, key],
+            )
             .await
             .map(|_| ())
             .context("delete memory")
     }
 
-    /// All stored keys, ordered (used to rebuild `/index` listings after restart).
-    pub async fn list_keys(&self) -> Result<Vec<String>> {
+    /// All known non-default agent_ids, ordered (for `/agents` directory listing).
+    pub async fn list_agents(&self) -> Result<Vec<String>> {
         let mut rows = self
             .conn
-            .query("SELECT key FROM memories ORDER BY key", ())
+            .query(
+                "SELECT DISTINCT agent_id FROM memories \
+                 WHERE agent_id != '' ORDER BY agent_id",
+                (),
+            )
+            .await
+            .context("list agents")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.context("fetch agent row")? {
+            out.push(row.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// All stored keys for `agent_id`, ordered (used to rebuild `/index`
+    /// listings after restart).
+    pub async fn list_keys(&self, agent_id: &str) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT key FROM memories WHERE agent_id = ? ORDER BY key",
+                params![agent_id],
+            )
             .await
             .context("list keys")?;
         let mut out = Vec::new();
@@ -228,16 +379,17 @@ impl MemoryDb {
         Ok(out)
     }
 
-    /// All stored `(key, byte_size)` pairs, ordered by key. Used to render the
-    /// `/index` listing with accurate file sizes without a follow-up `getattr`
-    /// per entry. `length(CAST(text AS BLOB))` is the byte length of the text
-    /// (TEXT `length()` would count characters, not bytes).
-    pub async fn list_with_size(&self) -> Result<Vec<(String, u64)>> {
+    /// All stored `(key, byte_size)` pairs for `agent_id`, ordered by key.
+    /// Used to render the `/index` listing with accurate file sizes without a
+    /// follow-up `getattr` per entry. `length(CAST(text AS BLOB))` is the byte
+    /// length of the text (TEXT `length()` would count characters, not bytes).
+    pub async fn list_with_size(&self, agent_id: &str) -> Result<Vec<(String, u64)>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT key, length(CAST(text AS BLOB)) FROM memories ORDER BY key",
-                (),
+                "SELECT key, length(CAST(text AS BLOB)) FROM memories \
+                 WHERE agent_id = ? ORDER BY key",
+                params![agent_id],
             )
             .await
             .context("list keys with size")?;
@@ -250,51 +402,62 @@ impl MemoryDb {
         Ok(out)
     }
 
-    /// The stored text for `key`, if present (lets `/index/<key>` be read back).
-    pub async fn get_text(&self, key: &str) -> Result<Option<String>> {
+    /// The stored text for `(agent_id, key)`, if present.
+    pub async fn get_text(&self, agent_id: &str, key: &str) -> Result<Option<String>> {
         let mut rows = self
             .conn
-            .query("SELECT text FROM memories WHERE key = ?", params![key])
+            .query(
+                "SELECT text FROM memories WHERE agent_id = ? AND key = ?",
+                params![agent_id, key],
+            )
             .await
             .context("get text")?;
         let row = rows.next().await.context("fetch text row")?;
         Ok(row.map(|r| r.get::<String>(0).unwrap_or_default()))
     }
 
-    /// Whether a memory exists under `key` (used by exclusive-create).
-    pub async fn exists(&self, key: &str) -> Result<bool> {
+    /// Whether a memory exists under `(agent_id, key)` (used by exclusive-create).
+    pub async fn exists(&self, agent_id: &str, key: &str) -> Result<bool> {
         let mut rows = self
             .conn
-            .query("SELECT 1 FROM memories WHERE key = ? LIMIT 1", params![key])
+            .query(
+                "SELECT 1 FROM memories WHERE agent_id = ? AND key = ? LIMIT 1",
+                params![agent_id, key],
+            )
             .await
             .context("exists check")?;
         Ok(rows.next().await.context("fetch exists row")?.is_some())
     }
 
-    /// Return up to `k` nearest memories `(key, text)`, ordered by ascending
-    /// cosine distance to `query_emb`.
-    pub async fn search(&self, query_emb: &[f32], k: i64) -> Result<Vec<(String, String)>> {
-        // NOTE: returns (key, text), not the SQL rowid — the key is the
-        // user-facing identifier written to /index/<key>.
+    /// Return up to `k` nearest memories `(key, text)` for `agent_id`, ordered
+    /// by ascending cosine distance to `query_emb`. The vector index is global;
+    /// results are filtered by agent_id after the KNN lookup.
+    pub async fn search(
+        &self,
+        agent_id: &str,
+        query_emb: &[f32],
+        k: i64,
+    ) -> Result<Vec<(String, String)>> {
         let json = vec_to_json(query_emb);
         let mut rows = self
             .conn
             .query(
-                "SELECT m.key, m.text FROM vector_top_k('memories_vec_idx', vector(?), ?) v JOIN memories m ON m.rowid = v.id",
-                params![json, k],
+                "SELECT m.key, m.text \
+                 FROM vector_top_k('memories_vec_idx', vector(?), ?) v \
+                 JOIN memories m ON m.rowid = v.id \
+                 WHERE m.agent_id = ?",
+                params![json, k, agent_id],
             )
             .await
             .context("vector_top_k query")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.context("fetch search row")? {
-            let key: String = row.get_key()?;
-            let text: String = row.get_text()?;
-            out.push((key, text));
+            out.push((row.get_key()?, row.get_text()?));
         }
         Ok(out)
     }
 
-    /// Full-text / prefix search for `/where/<cond>`.
+    /// Full-text / prefix search for `/where/<cond>`, scoped to `agent_id`.
     ///
     /// - `key:<prefix>` — filter memories whose key starts with `<prefix>`
     ///   (parameterized `LIKE`, never string-interpolated).
@@ -303,13 +466,18 @@ impl MemoryDb {
     ///
     /// Returns `(key, text)` rows ordered by relevance (FTS) or key (prefix).
     /// An empty/whitespace condition returns no rows rather than erroring.
-    pub async fn where_search(&self, cond: &str, k: i64) -> Result<Vec<(String, String)>> {
+    pub async fn where_search(
+        &self,
+        agent_id: &str,
+        cond: &str,
+        k: i64,
+    ) -> Result<Vec<(String, String)>> {
         let cond = cond.trim();
         if cond.is_empty() {
             return Ok(Vec::new());
         }
         if let Some(prefix) = cond.strip_prefix("key:") {
-            return self.key_prefix_search(prefix.trim(), k).await;
+            return self.key_prefix_search(agent_id, prefix.trim(), k).await;
         }
         // FTS5 MATCH. A bound parameter keeps this injection-safe even though
         // the expression syntax is user-controlled; bad queries -> no rows.
@@ -318,8 +486,9 @@ impl MemoryDb {
             .query(
                 "SELECT m.key, m.text FROM memories_fts f \
                  JOIN memories m ON m.rowid = f.rowid \
-                 WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
-                params![cond, k],
+                 WHERE memories_fts MATCH ? AND m.agent_id = ? \
+                 ORDER BY rank LIMIT ?",
+                params![cond, agent_id, k],
             )
             .await
             .context("fts5 match query")?;
@@ -330,15 +499,21 @@ impl MemoryDb {
         Ok(out)
     }
 
-    async fn key_prefix_search(&self, prefix: &str, k: i64) -> Result<Vec<(String, String)>> {
+    async fn key_prefix_search(
+        &self,
+        agent_id: &str,
+        prefix: &str,
+        k: i64,
+    ) -> Result<Vec<(String, String)>> {
         if prefix.is_empty() {
             return Ok(Vec::new());
         }
         let mut rows = self
             .conn
             .query(
-                "SELECT key, text FROM memories WHERE key LIKE ? || '%' ORDER BY key LIMIT ?",
-                params![prefix, k],
+                "SELECT key, text FROM memories \
+                 WHERE agent_id = ? AND key LIKE ? || '%' ORDER BY key LIMIT ?",
+                params![agent_id, prefix, k],
             )
             .await
             .context("key prefix query")?;

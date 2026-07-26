@@ -49,12 +49,12 @@ async fn recall_at_k<E: Embedder + Sync>(emb: &E, dim: usize, k: usize) -> (usiz
     let db = MemoryDb::open(":memory:", dim).await.unwrap();
     for (key, text) in corpus() {
         let v = emb.embed(text).await.unwrap();
-        db.upsert(key, text, &v).await.unwrap();
+        db.upsert("", key, text, &v).await.unwrap();
     }
     let mut hits = 0;
     for (q, expected) in questions() {
         let qv = emb.embed(q).await.unwrap();
-        let res = db.search(&qv, k as i64).await.unwrap();
+        let res = db.search("", &qv, k as i64).await.unwrap();
         if res.iter().any(|(key, _)| key == expected) {
             hits += 1;
         }

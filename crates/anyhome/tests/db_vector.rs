@@ -12,11 +12,11 @@ async fn smoke_vector_top_k() {
     let db = MemoryDb::open(":memory:", 3).await.expect("open db");
 
     // 'a' and 'c' both point near +x; 'b' points along +y.
-    db.upsert("a", "alpha", &[1.0, 0.0, 0.0]).await.unwrap();
-    db.upsert("b", "beta", &[0.0, 1.0, 0.0]).await.unwrap();
-    db.upsert("c", "gamma", &[0.9, 0.1, 0.0]).await.unwrap();
+    db.upsert("", "a", "alpha", &[1.0, 0.0, 0.0]).await.unwrap();
+    db.upsert("", "b", "beta", &[0.0, 1.0, 0.0]).await.unwrap();
+    db.upsert("", "c", "gamma", &[0.9, 0.1, 0.0]).await.unwrap();
 
-    let res = db.search(&[1.0, 0.0, 0.0], 2).await.expect("search");
+    let res = db.search("", &[1.0, 0.0, 0.0], 2).await.expect("search");
     assert_eq!(res.len(), 2, "k=2 returns two rows");
     // Exact match is top-1.
     assert_eq!(res[0].1, "alpha", "exact match ranks first");
@@ -47,12 +47,12 @@ async fn index_then_search_exact_match_top1() {
 
     for text in ["the quick brown fox", "lazy dogs", "nfs memory"] {
         let v = emb.embed(text).await.unwrap();
-        db.upsert(text, text, &v).await.unwrap();
+        db.upsert("", text, text, &v).await.unwrap();
     }
 
     let query = "lazy dogs";
     let qv = emb.embed(query).await.unwrap();
-    let res = db.search(&qv, 1).await.unwrap();
+    let res = db.search("", &qv, 1).await.unwrap();
     assert_eq!(res.len(), 1);
     assert_eq!(res[0].1, query, "exact-match query is top-1");
 }
@@ -62,10 +62,10 @@ async fn delete_removes_a_memory() {
     let dim = 8;
     let db = MemoryDb::open(":memory:", dim).await.unwrap();
     let v = dummy_embed("hello", dim);
-    db.upsert("k", "hello", &v).await.unwrap();
-    assert_eq!(db.search(&v, 10).await.unwrap().len(), 1);
-    db.delete("k").await.unwrap();
-    assert!(db.search(&v, 10).await.unwrap().is_empty());
+    db.upsert("", "k", "hello", &v).await.unwrap();
+    assert_eq!(db.search("", &v, 10).await.unwrap().len(), 1);
+    db.delete("", "k").await.unwrap();
+    assert!(db.search("", &v, 10).await.unwrap().is_empty());
 }
 
 #[test]
@@ -75,4 +75,29 @@ fn vec_to_json_is_valid_for_libsql() {
     // Every component must carry a decimal point (libsql vector() requirement).
     assert!(s.contains("1.0"));
     assert!(s.contains("2.5"));
+}
+
+/// Agent namespace isolation at the vector-search layer: a KNN search scoped to
+/// one agent must never surface rows that belong to a different agent, even
+/// when the key and the embedding are nearly identical.
+#[tokio::test]
+async fn agent_isolation_search() {
+    let db = MemoryDb::open(":memory:", 3).await.expect("open db");
+
+    // Same key "x", near-identical vectors, but different agents. The stored
+    // text differs so we can tell which row the search returned.
+    db.upsert("a", "x", "a-text", &[1.0, 0.0, 0.0]).await.unwrap();
+    db.upsert("b", "x", "b-text", &[0.9, 0.1, 0.0]).await.unwrap();
+
+    // Searching agent "a" must return only agent a's row.
+    let res_a = db.search("a", &[1.0, 0.0, 0.0], 10).await.expect("search a");
+    assert_eq!(res_a.len(), 1, "agent a sees only its own row: {res_a:?}");
+    assert_eq!(res_a[0].0, "x");
+    assert_eq!(res_a[0].1, "a-text");
+
+    // Searching agent "b" must return only agent b's row.
+    let res_b = db.search("b", &[1.0, 0.0, 0.0], 10).await.expect("search b");
+    assert_eq!(res_b.len(), 1, "agent b sees only its own row: {res_b:?}");
+    assert_eq!(res_b[0].0, "x");
+    assert_eq!(res_b[0].1, "b-text");
 }

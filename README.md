@@ -150,14 +150,15 @@ scripts/e2e.sh            # 自动构建→启动→挂载→index/search→断�
 
 核心链路已打通并通过测试：
 
-- `cargo test --workspace` = **45 用例全绿**（默认、零依赖）。
-- `cargo test --workspace --features embed-fastembed` = **49 用例全绿**（模型可用时；模型缺失自动跳过 fastembed 相关测试）。
+- `cargo test --workspace` = **62 用例全绿**（默认、零依赖）。
+- `cargo test --workspace --features embed-fastembed` = **66 用例全绿**（模型可用时；模型缺失自动跳过 fastembed 相关测试）。
 
 能力：
 
 - 依赖内嵌：`link_repos/{nfsserve,libsql}` 经 `scripts/bootstrap.sh` 可复现 pin。
 - NFS 后端分流：`AnyHomeFs`（dispatcher）把魔法路径导向 DB 层、其余路径导向文件系统层（`RealFs`）。
 - 魔法路径：`/search/<q>`（向量 KNN）、`/index/<key>`（写入即索引，多段 WRITE 按 offset 拼接不丢数据）、`/where/<词>`（FTS5 全文 MATCH）/ `/where/key:<前缀>`（key 前缀过滤）。`/search`、`/where` 为只读查询视图（写 / setattr 返回 `ROFS`）。
+- 多 Agent 命名空间隔离：`/agents/<id>/{search,index,where}` 为每个 agent 提供独立的 DB key 空间和检索作用域，互不可见。Agent 隐式创建（首次写入即创建）。全局 `/{search,index,where}` 保留并映射到默认 agent（`agent_id = ""`），向后兼容。
 - 向量检索：基于 libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，`vector_top_k` 已验证可按余弦距离排序。
 - 持久化：记忆写入 `--db-path` 指定的 DB 文件，重启存活；嵌入维度存于 `meta` 表、启动校验（不匹配=硬错误），FTS5 索引启动时按需自动重建。
 - CLI：`anyhome --fs-root/--db-path/--addr/--export/--dim/--embedder`，单端口服务。
@@ -184,4 +185,14 @@ scripts/e2e.sh            # 自动构建→启动→挂载→index/search→断�
 - **TODO-19（write 二进制安全）= done**：去除 `String::from_utf8_lossy` 的静默替换，非 UTF-8 写入显式返回 `NFS3ERR_INVAL`（之前破坏二进制）。
 - **TODO-20（回归测试 + 文档）= done**：新增 `tests/magic_write_semantics.rs`（10 个用例），更新本节与 changelog。
 
-> 已知限制：`/index` 写入缓冲为内存态，进程重启后未落库的缓冲会丢失（NFS 客户端在断开重连后通常会重新 `lookup`，属可接受语义）。多 agent 命名空间隔离（DB 无 `agent_id` 列、魔法路径全局、无鉴权）尚未实现，作为后续方向。
+已解决的 init-pro-4 TODO（多 Agent 命名空间隔离）：
+
+- **TODO-21（DB schema 迁移）= done**：`memories` 表增加 `agent_id TEXT NOT NULL DEFAULT ''` 列，唯一约束从 `key` 改为 `(agent_id, key)`；`meta` 表引入 `schema_version` 机制；v0→v1 自动迁移（建新表→复制→替换→重建索引/触发器），旧库数据完整保留。
+- **TODO-22（DB 查询参数化 agent_id）= done**：所有 `MemoryDb` 方法增加 `agent_id: &str` 参数，查询全部加 `WHERE agent_id = ?`；新增 `list_agents()` 枚举已知 agent。
+- **TODO-23（agent 作用域 fileid 编码）= done**：`magic_file_id` 哈希输入改为 scoped name（`"{agent_id}\0{name}"`），消除跨 agent fileid 碰撞；`MagicRegistry` 存储 `MagicEntry { agent_id, name, category }`。
+- **TODO-24（/agents 虚拟命名空间路由）= done**：`/agents/<id>/{search,index,where}` 多层路径解析；`/agents` readdir 列出已知 agent（`SELECT DISTINCT agent_id`）。
+- **TODO-25（Agent 作用域读写语义 + 向后兼容）= done**：全局 `/{search,index,where}` 透明映射到默认 agent（`agent_id = ""`），现有行为零破坏。
+- **TODO-26（集成测试）= done**：新增 `tests/agent_namespace.rs`（12 个用例），覆盖隔离性、兼容性、生命周期、回归。
+- **TODO-27（文档）= done**：更新本节与 changelog。
+
+> 已知限制：`/index` 写入缓冲为内存态，进程重启后未落库的缓冲会丢失（NFS 客户端在断开重连后通常会重新 `lookup`，属可接受语义）。命名空间隔离仅提供逻辑隔离，**不包含鉴权**（access-control / token / agent 身份校验），恶意 agent 可冒充他人 agent_id——鉴权留后续单独迭代。

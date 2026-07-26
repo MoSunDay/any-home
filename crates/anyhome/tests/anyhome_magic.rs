@@ -8,6 +8,7 @@ use nfsserve::vfs::NFSFileSystem;
 use tempfile::tempdir;
 
 use anyhome::db::{DummyEmbedder, Embedder};
+use anyhome::magic::{magic_file_id, scoped_name, CAT_INDEX};
 use anyhome::{AnyHomeFs, MemoryDb, RealFs};
 
 fn nm(s: &[u8]) -> filename3 {
@@ -207,4 +208,25 @@ async fn index_listing_and_text_survive_restart() {
         let (data, _) = fs.read(k1, 0, 4096).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&data), "first memory");
     }
+}
+
+/// The magic fileid for an agent-scoped entry is derived from the *scoped name*
+/// (`"{agent_id}\0{name}"`), so two different agents can hold the same key
+/// without their synthetic fileids colliding, and a single agent's two keys
+/// never collide either.
+#[test]
+fn magic_file_id_agent_scoped_no_collision() {
+    // Same key, different agents -> different fileids.
+    assert_ne!(
+        magic_file_id(CAT_INDEX, &scoped_name("agentA", "key1")),
+        magic_file_id(CAT_INDEX, &scoped_name("agentB", "key1")),
+        "same key under different agents must map to distinct fileids"
+    );
+
+    // Same agent, different keys -> different fileids.
+    assert_ne!(
+        magic_file_id(CAT_INDEX, &scoped_name("agentA", "key1")),
+        magic_file_id(CAT_INDEX, &scoped_name("agentA", "key2")),
+        "different keys under the same agent must map to distinct fileids"
+    );
 }

@@ -43,7 +43,7 @@ async fn index_write_appends_at_offset() {
     fs.write(id, 0, b"Hello").await.unwrap();
     fs.write(id, 5, b", world").await.unwrap();
 
-    let stored = fs.db.get_text("greet").await.unwrap().unwrap();
+    let stored = fs.db.get_text("", "greet").await.unwrap().unwrap();
     assert_eq!(stored, "Hello, world");
 }
 
@@ -66,7 +66,7 @@ async fn index_write_composes_many_chunks() {
 
     let expected: Vec<u8> = (0..repeats).flat_map(|_| chunk.iter().copied()).collect();
     // The DB stores the composed full text byte-for-byte.
-    let stored = fs.db.get_text("big").await.unwrap().unwrap();
+    let stored = fs.db.get_text("", "big").await.unwrap().unwrap();
     assert_eq!(stored.as_bytes(), expected.as_slice());
     // And a full read returns it with EOF.
     let (data, eof) = fs.read(id, 0, expected.len() as u32 + 100).await.unwrap();
@@ -84,7 +84,7 @@ async fn index_write_composes_with_existing_content() {
     let id = fs.lookup(index_dir, &nm(b"log")).await.unwrap();
     // Write past the existing end: the buffer is seeded from the DB first.
     fs.write(id, "line one\n".len() as u64, b"line two").await.unwrap();
-    let stored = fs.db.get_text("log").await.unwrap().unwrap();
+    let stored = fs.db.get_text("", "log").await.unwrap().unwrap();
     assert_eq!(stored, "line one\nline two");
 }
 
@@ -226,5 +226,5 @@ async fn index_write_rejects_invalid_utf8() {
     assert_eq!((err) as u32, nfsstat3::NFS3ERR_INVAL as u32);
 
     // Nothing was persisted under the key.
-    assert!(fs.db.get_text("bin").await.unwrap().is_none());
+    assert!(fs.db.get_text("", "bin").await.unwrap().is_none());
 }
