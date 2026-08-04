@@ -2,6 +2,8 @@
 
 # anyhome
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **面向 AI agent 的可挂载 NFSv3 记忆服务：把「记忆」变成一个本地文件系统。**
 
 ## 为什么

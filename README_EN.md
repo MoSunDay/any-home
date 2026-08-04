@@ -2,6 +2,8 @@
 
 # anyhome
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **A mountable NFSv3 memory service for AI agents: turn "memory" into a local file system.**
 
 ## Why
