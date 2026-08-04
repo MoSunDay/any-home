@@ -48,11 +48,62 @@ impl MemoryDb {
         let db = Builder::new_local(path).build().await.context("open libsql database")?;
         let conn = db.connect().context("connect libsql database")?;
         let store = MemoryDb { conn, dim };
+        store.configure_durability().await?;
         store.init_schema().await?;
         store.migrate_schema().await?;
         store.reconcile_dim().await?;
         store.ensure_fts_populated().await?;
         Ok(store)
+    }
+
+    /// Establish explicit, crash-safe durability. Sets WAL journal mode (so a
+    /// concurrent NFS `read` never blocks the writer) and `synchronous=FULL`
+    /// (every committed write is fsynced before the RPC returns). This makes
+    /// the durability guarantee explicit instead of relying on the bundled
+    /// SQLite's compile-time defaults. `journal_mode=WAL` returns a row (the
+    /// resulting mode), so it must go through `query`, not `execute` (which
+    /// rejects row-returning statements). A `:memory:` DB is unaffected (WAL does
+    /// not apply there) and the pragma returns `"memory"` without error.
+    async fn configure_durability(&self) -> Result<()> {
+        self.conn
+            .query("PRAGMA journal_mode=WAL", ())
+            .await
+            .context("set WAL journal mode")?;
+        self.conn
+            .query("PRAGMA synchronous=FULL", ())
+            .await
+            .context("set synchronous=FULL")?;
+        Ok(())
+    }
+
+    /// `(journal_mode, synchronous)` currently in effect. `synchronous`:
+    /// 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+    pub async fn durability(&self) -> Result<(String, i64)> {
+        let mut rows = self
+            .conn
+            .query("PRAGMA journal_mode", ())
+            .await
+            .context("query journal_mode")?;
+        let mode: String = rows
+            .next()
+            .await
+            .context("fetch journal_mode row")?
+            .context("journal_mode row missing")?
+            .get(0)
+            .context("journal_mode value")?;
+        let mut rows = self
+            .conn
+            .query("PRAGMA synchronous", ())
+            .await
+            .context("query synchronous")?;
+        let sync: i64 = rows
+            .next()
+            .await
+            .context("fetch synchronous row")?
+            .context("synchronous row missing")?
+            .get(0)
+            .context("synchronous value")?;
+        Ok((mode, sync))
     }
 
     /// Dimensionality of the embedding column.

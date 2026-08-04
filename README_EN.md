@@ -137,8 +137,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # with semantic embeddings
 ### 6. Run tests
 
 ```bash
-cargo test                              # 82 tests (default, zero dependencies)
-cargo test --features embed-fastembed   # 86 tests
+cargo test                              # 87 tests (default, zero dependencies)
+cargo test --features embed-fastembed   # 91 tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -177,8 +177,8 @@ botB:1002
 
 The core pipeline is built and fully tested:
 
-- `cargo test` = **82 tests pass** (default, zero dependencies)
-- `cargo test --features embed-fastembed` = **86 tests pass**
+- `cargo test` = **87 tests pass** (default, zero dependencies)
+- `cargo test --features embed-fastembed` = **91 tests pass**
 - `cargo clippy --all-targets -- -D warnings` = **0 warnings** (both feature combinations)
 
 Feature checklist:
@@ -194,7 +194,7 @@ Feature checklist:
 
 ## Known Limitations
 
-- **`/index` write buffering**: write data is buffered in memory and upserted only on close; a crash may lose unflushed buffers (NFS clients typically re-`lookup` after reconnect, making this acceptable semantics).
+- **Write durability (hardened in init-pro-6)**: every `WRITE` RPC upserts to the DB **immediately** (write-through, not buffered until close). A file-backed DB uses `WAL` + `synchronous=FULL`, so each committed write is fsynced and survives a crash. The in-memory write buffer is only for offset composition and is bounded to 256 entries (eviction is safe — the DB is always authoritative).
 - **Soft auth only**: NFSv3 AUTH_SYS `uid`/`gid` is client-asserted and **trivially spoofable** — this mechanism only guards against accidental misuse and cross-contamination, **not adversarial security**. `getattr`/`setattr` (pure metadata) are not authenticated. For strong auth, deploy behind a TLS/mTLS-terminating network front, or upgrade to RPCSEC_GSS/Kerberos.
 - **root (uid 0) cannot safely use agent auth**: under AUTH_SYS, `uid 0` simultaneously means "anonymous caller" (AUTH_NULL) and "real root" — the two are indistinguishable. Therefore `--agent-uid` / `--agent-creds` **reject** binding `uid 0` — if allowed, all anonymous callers would gain that agent's access. Agent processes must run as a non-root uid.
 

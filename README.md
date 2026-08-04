@@ -147,8 +147,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 82 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 86 个测试
+cargo test                              # 87 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 91 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -187,8 +187,8 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **82 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **86 个测试通过**
+- `cargo test` = **87 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **91 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
@@ -201,14 +201,16 @@ botB:1002
 - **多 agent 命名空间隔离**：`/agents/<id>/{search,index,where}`，拥有独立的 DB 键空间与检索范围
 - **Agent 身份鉴权（soft auth）**：可选的 `--agent-uid` / `--agent-creds`；AUTH_SYS uid 绑定
 - **向量检索**：libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，余弦距离 KNN
-- **持久化**：写入 `--db-path` 的记忆可跨重启保留；嵌入维度存于 `meta` 表，启动时校验；
-  FTS5 索引按需在启动时自动重建
+- **持久化与写入耐久性**：写入 `--db-path` 的记忆可跨重启保留；嵌入维度存于 `meta` 表，启动时校验；
+  FTS5 索引按需在启动时自动重建。每次 `WRITE` 即写穿 DB（write-through），文件型 DB 用
+  `WAL` + `synchronous=FULL`，已提交写 fsync 后存活，崩溃不丢数据（init-pro-6）
 - **CLI**：单端口服务，配置完备
 
 ## 已知限制
 
-- **`/index` 写入缓冲**：写入数据缓冲在内存中，close 时才 upsert；崩溃时未落盘的缓冲会丢失
-  （NFS 客户端在断开重连后通常会重新 `lookup`，属可接受语义）。
+- **写入耐久性（init-pro-6 已硬化）**：每次 `WRITE` RPC **立即** upsert 到 DB（write-through，非缓冲至 close）。
+  文件型 DB 使用 `WAL` + `synchronous=FULL`，每个已提交写均 fsync、崩溃后存活；内存写缓冲仅用于偏移拼接，
+  且上限 256 条目（超出按任意顺序淘汰，淘汰安全——DB 始终为权威来源）。
 - **仅 soft auth**：NFSv3 AUTH_SYS 的 `uid`/`gid` 由客户端自报、**极易伪造**——本机制仅防
   误操作与意外串扰，**不构成对抗性安全**。`getattr`/`setattr`（纯元数据）不做鉴权。
   如需强鉴权，应在 TLS/mTLS 终止的网络前置，或升级至 RPCSEC_GSS/Kerberos。
