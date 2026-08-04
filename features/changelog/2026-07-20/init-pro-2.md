@@ -106,5 +106,5 @@ init-pro 把 anyhome 落地为可挂载的 NFSv3 记忆服务 MVP，但留下几
 
 ## Related Docs
 
-- [plans/init-pro-2/index.md](../../plans/init-pro-2/index.md)
+- [plans/init-pro-2/index.md](../../../plans/init-pro-2/index.md)
 - [既有相关 changelog：init-pro](../2026-07-19/init-nfs-memory-service.md)

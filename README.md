@@ -1,45 +1,61 @@
+[English](README_EN.md) | [中文](README.md)
+
 # anyhome
 
-面向 AI agent 的记忆系统。核心想法：把「记忆」做成一个本地 NFS 服务，agent 用最朴素的文件
-操作（`ls` / `cat` / `echo` / `vim` ...）就能读写和检索记忆——无需任何专用 SDK 或 API。
+**面向 AI agent 的可挂载 NFSv3 记忆服务：把「记忆」变成一个本地文件系统。**
 
 ## 为什么
 
-AI agent 需要长期、可检索、能被多种工具共享的记忆。现有方案大多要求 agent 调用一套专有
-API，结果是每个工具 / 框架都要重新对接一次，agent 也用不上自己本就擅长的「操作文件」能力。
+anyhome 把「记忆」做成一个本地 NFS 服务。AI agent 用最朴素的文件操作
+（`ls` / `cat` / `echo` / `vim` …）就能读写和检索记忆——无需任何专用 SDK，无需任何 API。
 
-NFS 几乎被所有操作系统原生支持、都能挂载。把记忆暴露成一个 localhost 上的 NFSv3 服务，
-agent 用「读文件 / 写文件」这一最通用的能力即可访问记忆；shell、Python、Node、GUI 编辑器
-全部零适配直接可用。
+NFS 几乎被所有操作系统原生支持、都能挂载。把记忆暴露成 `localhost` 上的 NFSv3 服务，
+agent 用「读文件 / 写文件」这一最通用的能力即可访问记忆；shell、Python、Node、GUI
+编辑器全部零适配直接可用。
 
 ## 设计
 
-按「能否被穷举、是否好按路径检索」，把记忆分两层：
+按「能否被穷举、是否好按路径检索」，把记忆分两层，再用「魔法路径」把两层连通：
 
 ### 1. 文件系统层 —— 存可穷举、好检索的数据
-凡是天然呈树状、可枚举、能按路径定位的记忆，直接以文件 / 目录形式存在于 NFS 视图里。agent
-可以 `ls` 浏览、`cat` 读取、`echo` 写入、`mkdir` 分类，就像管理一个真实目录。
+
+凡是天然呈树状、可枚举、能按路径定位的记忆，直接以文件 / 目录形式存在于 NFS 视图里。
+agent 可以 `ls` 浏览、`cat` 读取、`echo` 写入、`mkdir` 分类，就像管理一个真实目录。
 
 > 例：`/agents/<id>/profile.md`、`/sessions/<id>/messages.log`、`/knowledge/<topic>/note.md`。
 
 ### 2. DB 层 —— 存不好检索的数据
-凡是不可穷举、需要按语义 / 向量 / 全文检索的内容，放进数据库（基于内嵌的
-[libSQL](./link_repos/libsql)，原生支持向量检索）。这部分对 agent 是「海量、不可枚举」的，
+
+凡是不可穷举、需要按语义 / 向量 / 全文检索的内容，放进数据库（基于内嵌的 libSQL ——
+一个原生支持向量检索的 SQLite 衍生分支）。这部分对 agent 是「海量、不可枚举」的，
 不适合摊成扁平文件。
 
 ### 3. 魔法路径 —— 用 NFS 路径做查询
+
 把 DB 的检索能力伪装成文件系统的路径，agent 依然只需文件操作就能查 DB：
 
-- **向量检索**：`cat /search/语义相关的笔记` —— 路径即 query，读到的「文件内容」就是 DB 的
-  检索结果。
-- **写入即索引**：`echo "待检索文本" > /index/<key>` —— 写入同时被向量化入库，供日后检索。
-- **过滤 / 全文查询**：`cat /where/<词>` —— SQLite FTS5 全文检索（MATCH），返回命中记忆的
-  `key\ttext` 行；`cat /where/key:<前缀>` 则按 key 前缀过滤（如 `cat /where/key:gree`
-  命中所有 key 以 `gree` 开头的记忆）。
+- **向量检索**：`cat /search/<query>` —— 向量 KNN 检索，路径即 query，文件内容为结果
+  （每行 `key<TAB>text`）。
+- **写入索引**：`echo "text" > /index/<key>` —— 写入即嵌入并 upsert 进向量库。
+- **全文检索**：`cat /where/<word>` —— FTS5 全文 MATCH 检索。
+- **键前缀过滤**：`cat /where/key:<prefix>` —— 按 key 前缀过滤。
 
-实现上对 NFS 协议做一次薄改：命中特定「查询目录」前缀的 `read` / `write` 不落盘，而是把路径
-解析为查询、把结果作为文件内容返回。对 agent 而言，整个记忆系统始终是一棵统一的、可挂载的
-目录树。
+### 多 agent 命名空间隔离
+
+每个 agent 拥有独立的魔法路径命名空间：
+
+- `/agents/<id>/search/<q>` —— 仅在 agent `<id>` 范围内做 KNN
+- `/agents/<id>/index/<key>` —— 写入归入 agent `<id>`
+- `/agents/<id>/where/<cond>` —— 仅在 agent `<id>` 范围内做 FTS / 前缀
+- 首次写入即隐式创建 agent
+- 全局 `/search`、`/index`、`/where` 映射到默认 agent（`agent_id = ""`），保持向后兼容
+
+### Agent 身份鉴权（soft auth）
+
+可选。注册 agent 凭证，把 `agent_id` 绑定到调用方 NFS `AUTH_SYS` 的 `uid`。开启后，
+调用方必须拥有匹配的 `uid` 才能访问 `/agents/<id>/...`；冒充访问返回 `NFS3ERR_ACCES`；
+未授权的 agent 会在 `/agents` 列表中被隐藏。默认 agent（全局 `/{search,index,where}`）
+始终公开。当未配置任何凭证时，鉴权关闭（`Open` 策略），完全向后兼容。
 
 ## 架构
 
@@ -61,138 +77,179 @@ agent 用「读文件 / 写文件」这一最通用的能力即可访问记忆�
               +--------------------------+    +-------------------------------+
 ```
 
-`link_repos/` 下的两个仓库是**只读内嵌依赖**（各自独立 git 仓库），不在本仓库内二次开发：
+## 快速开始
 
-- [`link_repos/nfsserve`](./link_repos/nfsserve) —— 提供纯用户态 NFSv3 服务引擎，其
-  `NFSFileSystem` trait 是本项目唯一的集成边界：实现一个自定义后端，把 `read` / `write` /
-  `readdir` / `lookup` 等操作分流到「文件系统层」或「DB 层」。
-- [`link_repos/libsql`](./link_repos/libsql) —— 提供 DB 与向量检索后端：原生 `vector('…')`
-  类型 + `libsql_vector_idx(v)` KNN 索引。
+### 0. 准备只读内嵌依赖
 
-## 使用
+`link_repos/{nfsserve,libsql}` 是钉死的、只读的内嵌依赖，已被 gitignore。用脚本可复现地引导：
 
-### 0. 准备依赖（只读内嵌）
 ```bash
-scripts/bootstrap.sh        # 克隆并 pin link_repos/{nfsserve,libsql}
+scripts/bootstrap.sh
 ```
 
 ### 1. 构建
+
 ```bash
-cargo build --workspace
+cargo build          # 默认：dummy embedder，零网络依赖
+cargo build --features embed-fastembed   # 真实语义嵌入（ONNX all-MiniLM-L6-v2，dim 384）
 ```
 
 ### 2. 启动服务
-```bash
-./target/debug/anyhome \
-    --fs-root ./anyhome-fs \
-    --db-path ./memories.db \
-    --addr 127.0.0.1:11111
-```
 
-> nfsserve 把 NFS / MOUNT / portmap 三个服务**复用在同一个端口**，且不跑 rpcbind、不实现 NLM。
-> 因此挂载时必须显式指定 `vers=3,tcp,nolock,noacl,port=<端口>,mountport=<端口>`。
+```bash
+cargo run -- --fs-root ./anyhome-fs --db-path ./anyhome.db --addr 127.0.0.1:11111
+# 带语义检索：
+cargo run --features embed-fastembed -- --embedder fastembed --db-path ./anyhome.db
+# 带 agent 鉴权：
+cargo run -- --agent-uid botA:1001 --agent-uid botB:1002 --db-path ./anyhome.db
+# 或从凭证文件加载：
+cargo run -- --agent-creds /etc/anyhome/agents.conf
+```
 
 ### 3. 挂载（需要 `mount.nfs` 与内核 NFS 客户端）
+
 ```bash
 mkdir -p /mnt/anyhome
-mount.nfs -o vers=3,tcp,nolock,noacl,port=11111,mountport=11111 localhost:/ /mnt/anyhome
+mount -t nfs -o port=11111,mountport=11111,nfsvers=3,nolock 127.0.0.1:/ /mnt/anyhome
 ```
 
-### 4. 读写记忆（最朴素的文件操作）
+### 4. 用纯文件操作读写记忆
+
 ```bash
-# 写入即向量化入库
+# 写入 = 嵌入 + upsert 进向量库
 echo "hello anyhome" > /mnt/anyhome/index/greeting
 
-# 路径即 query：读到的「文件内容」就是向量检索结果（key\ttext / 行）
-cat /mnt/anyhome/search/hello%20anyhome
+# 路径即 query：读取返回向量 KNN 结果（每行 key<TAB>text）
+cat /mnt/anyhome/search/hello
 # => greeting	hello anyhome
 
-# FTS5 全文检索：命中所有 text 包含该词的记忆
-cat /mnt/anyhome/where/anyhome
+# FTS5 全文检索
+cat /mnt/anyhome/where/hello
 # => greeting	hello anyhome
 
-# 按 key 前缀过滤
-cat /mnt/anyhome/where/key:gree
-# => greeting	hello anyhome
+# key 前缀过滤
+cat /mnt/anyhome/where/key:gre
 
-# 文件系统层照常可用
-mkdir -p /mnt/anyhome/notes && echo "普通文件" > /mnt/anyhome/notes/a.md
-ls /mnt/anyhome            # index/  search/  where/  notes/  ...
+# 文件系统层照常工作
+echo "# my notes" > /mnt/anyhome/notes/readme.md
 ```
 
-### 5. 端到端冒烟
+### 5. 端到端冒烟测试
+
 ```bash
-scripts/e2e.sh            # 自动构建→启动→挂载→index/search→断言→清理
+scripts/e2e.sh                          # 无 mount.nfs 则跳过
+scripts/e2e.sh --require-mount          # 无 mount.nfs 则硬失败
+ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ```
 
-> 默认 `/search` 由 `DummyEmbedder`（确定性、零依赖）驱动：相同文本 → 余弦相似度 1 → 命中 top-1。
-> 真正的语义嵌入（local ONNX `Qdrant/all-MiniLM-L6-v2`，dim=384）已落地，但 feature-gated、默认关闭：
->
-> ```bash
-> # 一次性预取模型到标准 HF cache（离线 / 镜像环境用）
-> scripts/fetch-model.sh          # 或 scripts/fetch-model.sh --mirror 走 hf-mirror.com
->
-> # 带 fastembed feature 构建 + 以真实 embedder 启动
-> cargo build --workspace --features embed-fastembed
-> ./target/debug/anyhome --embedder fastembed \
->     --fs-root ./anyhome-fs --db-path ./memories.db --addr 127.0.0.1:11111
-> ```
->
-> 此时 `/search/语义近似的问法` 即可语义召回（10 条 paraphrase 集合上 recall@3 = 1.00，DummyEmbedder 仅 0.30）。
+### 6. 运行测试
 
-### 6. 持久化
-记忆持久化在 SQLite/libSQL DB 文件（`--db-path`）里，进程重启后照常存活：
+```bash
+cargo test                              # 82 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 86 个测试
+cargo clippy --all-targets -- -D warnings
+```
 
-- 嵌入维度记录在 `meta` 表（首次打开写入），启动时校验；与历史数据不匹配即**硬错误**（拒绝启动），防止维度错配损坏索引。
-- FTS5 全文索引随 DB 同表保存；若启动时索引为空（如外部重建后），自动 `rebuild` 填充。
+## CLI 参考
+
+```
+anyhome [OPTIONS]
+
+OPTIONS:
+    --fs-root <PATH>           支撑文件系统层的磁盘目录（默认 ./anyhome-fs）
+    --db-path <PATH>           libSQL 数据库路径，":memory:" 为临时库（默认 :memory:）
+    --addr <IP:PORT>           监听地址，单端口多路复用（默认 127.0.0.1:11111）
+    --export <PATH>            暴露给 NFS 客户端的导出路径（默认 /）
+    --embedder <KIND>          dummy（默认）或 fastembed（需 --features embed-fastembed）
+    --dim <N>                  dummy embedder 的向量维度（默认 64；fastembed 固定 384）
+    --agent-uid <ID:UID>       把 agent_id 绑定到调用方 AUTH_SYS uid（可重复）。开启鉴权。
+    --agent-creds <FILE>       凭证文件，每行一个 id:uid，支持 # 注释。开启鉴权。
+```
+
+凭证文件格式（`--agent-creds`）：
+
+```
+# agent credentials
+botA:1001
+botB:1002
+```
+
+## 嵌入后端
+
+| 后端 | Feature | 模型 | `/search` 行为 | 网络 |
+|------|---------|------|----------------|------|
+| `dummy`（默认） | — | 确定性哈希 | 仅精确匹配 | 无 |
+| `fastembed` | `embed-fastembed` | all-MiniLM-L6-v2（dim 384，本地 ONNX） | 真实语义 KNN | 模型仅获取一次（或用 `scripts/fetch-model.sh` 预取） |
 
 ## 状态
 
-核心链路已打通并通过测试：
+核心管线已构建并通过完整测试：
 
-- `cargo test --workspace` = **62 用例全绿**（默认、零依赖）。
-- `cargo test --workspace --features embed-fastembed` = **66 用例全绿**（模型可用时；模型缺失自动跳过 fastembed 相关测试）。
+- `cargo test` = **82 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **86 个测试通过**
+- `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
-能力：
+能力清单：
 
-- 依赖内嵌：`link_repos/{nfsserve,libsql}` 经 `scripts/bootstrap.sh` 可复现 pin。
-- NFS 后端分流：`AnyHomeFs`（dispatcher）把魔法路径导向 DB 层、其余路径导向文件系统层（`RealFs`）。
-- 魔法路径：`/search/<q>`（向量 KNN）、`/index/<key>`（写入即索引，多段 WRITE 按 offset 拼接不丢数据）、`/where/<词>`（FTS5 全文 MATCH）/ `/where/key:<前缀>`（key 前缀过滤）。`/search`、`/where` 为只读查询视图（写 / setattr 返回 `ROFS`）。
-- 多 Agent 命名空间隔离：`/agents/<id>/{search,index,where}` 为每个 agent 提供独立的 DB key 空间和检索作用域，互不可见。Agent 隐式创建（首次写入即创建）。全局 `/{search,index,where}` 保留并映射到默认 agent（`agent_id = ""`），向后兼容。
-- 向量检索：基于 libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，`vector_top_k` 已验证可按余弦距离排序。
-- 持久化：记忆写入 `--db-path` 指定的 DB 文件，重启存活；嵌入维度存于 `meta` 表、启动校验（不匹配=硬错误），FTS5 索引启动时按需自动重建。
-- CLI：`anyhome --fs-root/--db-path/--addr/--export/--dim/--embedder`，单端口服务。
+- **只读内嵌依赖**：`link_repos/{nfsserve,libsql}` 已钉版本，通过 `scripts/bootstrap.sh` 可复现构建
+- **NFS 后端分发**：`AnyHomeFs` 把魔法路径路由到 DB 层，其余路由到文件系统层（`RealFs`）
+- **魔法路径**：`/search/<q>`（向量 KNN）、`/index/<key>`（写入 = 嵌入 + upsert）、
+  `/where/<word>`（FTS5 MATCH）/ `/where/key:<prefix>`（key 前缀过滤）。`/search` 与
+  `/where` 是只读查询视图（写入 / setattr 返回 `ROFS`）
+- **多 agent 命名空间隔离**：`/agents/<id>/{search,index,where}`，拥有独立的 DB 键空间与检索范围
+- **Agent 身份鉴权（soft auth）**：可选的 `--agent-uid` / `--agent-creds`；AUTH_SYS uid 绑定
+- **向量检索**：libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，余弦距离 KNN
+- **持久化**：写入 `--db-path` 的记忆可跨重启保留；嵌入维度存于 `meta` 表，启动时校验；
+  FTS5 索引按需在启动时自动重建
+- **CLI**：单端口服务，配置完备
 
-已解决的 init-pro TODO：
+## 已知限制
 
-- **TODO-04（真实语义 embedder）= 已解锁**：默认 `DummyEmbedder` 零依赖、确定性；真实语义嵌入（本地 ONNX `Qdrant/all-MiniLM-L6-v2`，dim=384）由 `embed-fastembed` feature + `--embedder fastembed` 开启。10 条 paraphrase 集合上 recall@3 = 1.00（DummyEmbedder 仅 0.30），证明有效。模型不可用时相关测试 / 启动自动跳过。
-- **TODO-05（`/where` 过滤查询）= done**：FTS5 全文 MATCH + `key:<前缀>` 过滤。
-- **TODO-08（持久化 / 重启存活）= done**。
-- **TODO-09（`/where` FTS5 过滤）= done**。
-- **TODO-10（真实语义 embedder）= done**（feature-gated，模型不可用自动跳过）。
-- **TODO-11（`--export` 接线 + mount）= done**。
-- **TODO-12（真实挂载 e2e）= done**（代码层完成；实机验证需 `mount.nfs`，沙箱无此命令时 `scripts/e2e.sh` 自动跳过）。
+- **`/index` 写入缓冲**：写入数据缓冲在内存中，close 时才 upsert；崩溃时未落盘的缓冲会丢失
+  （NFS 客户端在断开重连后通常会重新 `lookup`，属可接受语义）。
+- **仅 soft auth**：NFSv3 AUTH_SYS 的 `uid`/`gid` 由客户端自报、**极易伪造**——本机制仅防
+  误操作与意外串扰，**不构成对抗性安全**。`getattr`/`setattr`（纯元数据）不做鉴权。
+  如需强鉴权，应在 TLS/mTLS 终止的网络前置，或升级至 RPCSEC_GSS/Kerberos。
+- **root（uid 0）无法安全使用 agent 鉴权**：AUTH_SYS 下 `uid 0` 同时表示「匿名调用方」（AUTH_NULL）与「真实 root」，二者不可区分。
+  因此 `--agent-uid` / `--agent-creds` 会**拒绝** `uid 0` 的绑定——若允许，所有匿名调用方将获得该 agent 的访问权。agent 进程须以非 root uid 运行。
 
-> 注：init-pro 的 TODO-07（真实挂载 e2e）同 TODO-12——代码与脚本就绪，仅沙箱缺 `mount.nfs` / 内核 NFS 客户端时自动跳过。
+## 项目结构
 
-已解决的 init-pro-3 TODO（魔法路径正确性与健壮性）：
+```
+anyhome/
+├── crates/anyhome/
+│   ├── src/
+│   │   ├── lib.rs          # library crate 根
+│   │   ├── main.rs         # 二进制入口，构建 AnyHomeFs
+│   │   ├── cli.rs          # clap CLI 定义
+│   │   ├── dispatcher.rs   # AnyHomeFs：NFSFileSystem 分发（真实 fs + 魔法路径）
+│   │   ├── auth.rs         # AuthPolicy、CallerCred、AgentCred（soft auth）
+│   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
+│   │   ├── backend/        # RealFs：磁盘文件系统层
+│   │   └── db/             # MemoryDb（libsql）、embedder trait 及其实现
+│   └── tests/              # 集成测试（10 个文件）
+├── link_repos/             # 只读内嵌依赖（gitignored）
+│   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
+│   └── libsql/             # 原生支持向量检索的 SQLite 衍生分支
+├── scripts/
+│   ├── bootstrap.sh        # 可复现的依赖准备 + 补丁应用
+│   ├── e2e.sh              # 端到端 NFS 挂载冒烟测试
+│   ├── fetch-model.sh      # 预取 fastembed 模型以便离线使用
+│   └── patches/            # 在钉死的上游之上应用的本地 fork 补丁
+├── features/changelog/     # 迭代 changelog（设计历史）
+├── Cargo.toml              # workspace 根
+└── rust-toolchain.toml     # MSRV 钉版本（1.85.0）
+```
 
-- **TODO-14（write 支持 offset）= done**：同一魔法文件的多次 WRITE 按 offset 拼接进写入缓冲区后再落库（之前忽略 offset，大文本被拆成多段 RPC 时互相覆盖）。
-- **TODO-15（create_exclusive 独占语义）= done**：对已存在 key 的独占创建返回 `NFS3ERR_EXIST`（之前对已存在文件仍返回 Ok）。
-- **TODO-16（只读端点显式错误）= done**：对 `/search`、`/where` 的 `write`/`setattr` 返回 `NFS3ERR_ROFS`（之前静默成功空操作）。
-- **TODO-17（getattr 真实大小）= done**：`/index` 文件的 `getattr`/`readdir` 报告真实字节数（之前恒报 1 MiB）。`/search`、`/where` 因内容随查询动态生成，维持虚拟上限值。
-- **TODO-18（句柄跨重启存活）= done**：`/index` 的 fileid→name 映射在内存缺失时可从 DB 推导恢复，旧句柄重启后仍可读（之前内存映射丢失即 `NOENT`）。
-- **TODO-19（write 二进制安全）= done**：去除 `String::from_utf8_lossy` 的静默替换，非 UTF-8 写入显式返回 `NFS3ERR_INVAL`（之前破坏二进制）。
-- **TODO-20（回归测试 + 文档）= done**：新增 `tests/magic_write_semantics.rs`（10 个用例），更新本节与 changelog。
+实现说明：
 
-已解决的 init-pro-4 TODO（多 Agent 命名空间隔离）：
+- `link_repos/*` 是只读内嵌依赖（独立 git 仓库，已 gitignore），**不是** workspace 成员。
+  nfsserve 携带一个小型本地 fork 补丁（`scripts/patches/nfsserve-auth-identity.patch`），
+  由 `scripts/bootstrap.sh` 应用，用以把 AUTH_SYS 调用方身份暴露给 `NFSFileSystem` trait。
+- nfsserve 的 `NFSFileSystem` trait 是唯一的集成边界。
 
-- **TODO-21（DB schema 迁移）= done**：`memories` 表增加 `agent_id TEXT NOT NULL DEFAULT ''` 列，唯一约束从 `key` 改为 `(agent_id, key)`；`meta` 表引入 `schema_version` 机制；v0→v1 自动迁移（建新表→复制→替换→重建索引/触发器），旧库数据完整保留。
-- **TODO-22（DB 查询参数化 agent_id）= done**：所有 `MemoryDb` 方法增加 `agent_id: &str` 参数，查询全部加 `WHERE agent_id = ?`；新增 `list_agents()` 枚举已知 agent。
-- **TODO-23（agent 作用域 fileid 编码）= done**：`magic_file_id` 哈希输入改为 scoped name（`"{agent_id}\0{name}"`），消除跨 agent fileid 碰撞；`MagicRegistry` 存储 `MagicEntry { agent_id, name, category }`。
-- **TODO-24（/agents 虚拟命名空间路由）= done**：`/agents/<id>/{search,index,where}` 多层路径解析；`/agents` readdir 列出已知 agent（`SELECT DISTINCT agent_id`）。
-- **TODO-25（Agent 作用域读写语义 + 向后兼容）= done**：全局 `/{search,index,where}` 透明映射到默认 agent（`agent_id = ""`），现有行为零破坏。
-- **TODO-26（集成测试）= done**：新增 `tests/agent_namespace.rs`（12 个用例），覆盖隔离性、兼容性、生命周期、回归。
-- **TODO-27（文档）= done**：更新本节与 changelog。
+## 依赖与构建要求
 
-> 已知限制：`/index` 写入缓冲为内存态，进程重启后未落库的缓冲会丢失（NFS 客户端在断开重连后通常会重新 `lookup`，属可接受语义）。命名空间隔离仅提供逻辑隔离，**不包含鉴权**（access-control / token / agent 身份校验），恶意 agent 可冒充他人 agent_id——鉴权留后续单独迭代。
+- Rust 1.85.0（通过 `rust-toolchain.toml` 钉版本）
+- 带有 NFS 客户端支持（`mount.nfs`）的 Linux，用于挂载
+- git + 网络访问，用于首次运行 `scripts/bootstrap.sh`

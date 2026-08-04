@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nfsserve::nfs::*;
+
+use crate::auth::{AuthPolicy, CallerCred};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 use crate::backend::{RealFs, ROOT_ID};
@@ -35,6 +37,7 @@ pub struct AnyHomeFs {
     pub db: MemoryDb,
     pub embedder: Arc<dyn Embedder>,
     magic: MagicRegistry,
+    auth: AuthPolicy,
 }
 
 impl AnyHomeFs {
@@ -44,6 +47,35 @@ impl AnyHomeFs {
             db,
             embedder,
             magic: MagicRegistry::default(),
+            auth: AuthPolicy::default(),
+        }
+    }
+
+    /// Attach an authorization policy. When omitted the policy stays
+    /// [`crate::auth::AuthPolicy::Open`] (auth disabled, identical to
+    /// init-pro-4) so existing callers/tests are unaffected.
+    pub fn with_auth(mut self, auth: AuthPolicy) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// The AUTH_SYS credential of the current RPC caller, surfaced from the
+    /// RPC layer's task-local. Anonymous (`uid == 0`) when no AUTH_SYS
+    /// credential was supplied or when running outside the server (unit tests).
+    fn current_caller(&self) -> CallerCred {
+        CallerCred {
+            uid: nfsserve::identity::current_identity().uid,
+        }
+    }
+
+    /// Reject the call unless the current caller may act as `agent_id`.
+    /// Returns [`nfsstat3::NFS3ERR_ACCES`] on impersonation. A no-op under
+    /// [`crate::auth::AuthPolicy::Open`] and for the default agent (`""`).
+    fn require_agent(&self, agent_id: &str) -> std::result::Result<(), nfsstat3> {
+        if self.auth.permits(self.current_caller(), agent_id) {
+            Ok(())
+        } else {
+            Err(nfsstat3::NFS3ERR_ACCES)
         }
     }
 
@@ -238,8 +270,10 @@ impl NFSFileSystem for AnyHomeFs {
         }
 
         // /agents level: any name becomes an agent container dir.
+        // Authorization gate: the caller must be permitted to act as this agent.
         if dirid == AGENTS_DIR {
             let agent_id = percent_decode(filename);
+            self.require_agent(&agent_id)?;
             let id = magic_file_id(CAT_AGENT, &agent_id);
             self.magic
                 .register(id, MagicEntry::new(&agent_id, &agent_id, CAT_AGENT));
@@ -253,6 +287,7 @@ impl NFSFileSystem for AnyHomeFs {
                 .get_entry(dirid)
                 .map(|e| e.agent_id)
                 .unwrap_or_default();
+            self.require_agent(&agent_id)?;
             let (sub, cat) = match filename.as_slice() {
                 b"search" => ("search", crate::magic::CAT_AGENT_SEARCH),
                 b"index" => ("index", crate::magic::CAT_AGENT_INDEX),
@@ -270,6 +305,7 @@ impl NFSFileSystem for AnyHomeFs {
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
+            self.require_agent(&agent_id)?;
             let scoped = scoped_name(&agent_id, &name);
             let id = magic_file_id(cat, &scoped);
             self.magic
@@ -329,6 +365,7 @@ impl NFSFileSystem for AnyHomeFs {
                 }
                 _ => self.magic.get_entry(id).ok_or(nfsstat3::NFS3ERR_NOENT)?,
             };
+            self.require_agent(&entry.agent_id)?;
             let content = match cat {
                 CAT_SEARCH => self.run_search(&entry.agent_id, &entry.name).await?,
                 CAT_WHERE => self.run_where(&entry.agent_id, &entry.name).await?,
@@ -356,6 +393,7 @@ impl NFSFileSystem for AnyHomeFs {
                         .index_name_for(id)
                         .await
                         .ok_or(nfsstat3::NFS3ERR_NOENT)?;
+                    self.require_agent(&agent_id)?;
                     if !self.magic.has_buffer(id) {
                         if let Ok(Some(existing)) = self.db.get_text(&agent_id, &key).await {
                             self.magic.seed_buffer(id, existing.into_bytes());
@@ -382,6 +420,7 @@ impl NFSFileSystem for AnyHomeFs {
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
+            self.require_agent(&agent_id)?;
             let scoped = scoped_name(&agent_id, &name);
             let id = magic_file_id(cat, &scoped);
             self.magic
@@ -399,6 +438,7 @@ impl NFSFileSystem for AnyHomeFs {
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
+            self.require_agent(&agent_id)?;
             let scoped = scoped_name(&agent_id, &name);
             let id = magic_file_id(cat, &scoped);
             let exists = match cat {
@@ -434,6 +474,7 @@ impl NFSFileSystem for AnyHomeFs {
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
+            self.require_agent(&agent_id)?;
             let scoped = scoped_name(&agent_id, &name);
             let id = magic_file_id(cat, &scoped);
             if cat == CAT_INDEX {
@@ -486,11 +527,14 @@ impl NFSFileSystem for AnyHomeFs {
         start_after: fileid3,
         max_entries: usize,
     ) -> std::result::Result<ReadDirResult, nfsstat3> {
-        // /agents: list known agent directories from the DB.
+        // /agents: list known agent directories from the DB, hiding any the
+        // current caller is not authorized to access.
         if dirid == AGENTS_DIR {
+            let caller = self.current_caller();
             let agents = self.db.list_agents().await.unwrap_or_default();
             let mut entries: Vec<DirEntry> = agents
                 .into_iter()
+                .filter(|agent_id| self.auth.permits(caller, agent_id))
                 .map(|agent_id| {
                     let id = magic_file_id(CAT_AGENT, &agent_id);
                     self.magic
@@ -516,6 +560,7 @@ impl NFSFileSystem for AnyHomeFs {
                 .get_entry(dirid)
                 .map(|e| e.agent_id)
                 .unwrap_or_default();
+            self.require_agent(&agent_id)?;
             let subdirs: [(&str, u8); 3] = [
                 ("search", crate::magic::CAT_AGENT_SEARCH),
                 ("index", crate::magic::CAT_AGENT_INDEX),
@@ -545,6 +590,7 @@ impl NFSFileSystem for AnyHomeFs {
         // Magic dirs with files (global + agent-scoped).
         if let Some(cat) = self.dir_category(dirid) {
             let agent_id = self.agent_id_of_dir(dirid);
+            self.require_agent(&agent_id)?;
             if cat == CAT_INDEX {
                 let mut sized: Vec<(fileid3, String, u64)> = self
                     .db

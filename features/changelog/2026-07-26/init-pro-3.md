@@ -78,5 +78,5 @@ init-pro / init-pro-2 已交付可挂载的 NFSv3 记忆服务 MVP（35/39 测�
 
 ## Related Docs
 
-- [plans/init-pro-3/index.md](../../plans/init-pro-3/index.md)
+- [plans/init-pro-3/index.md](../../../plans/init-pro-3/index.md)
 - [既有 changelog：init-pro-2](../2026-07-20/init-pro-2.md)

@@ -77,5 +77,5 @@ DB 与 fileid 编码全部按 agent 分片，旧的全局 `/search`、`/index`�
 
 ## Related Docs
 
-- [plans/init-pro-4/index.md](../../plans/init-pro-4/index.md)
+- [plans/init-pro-4/index.md](../../../plans/init-pro-4/index.md)
 - [既有 changelog：init-pro-3](./init-pro-3.md)

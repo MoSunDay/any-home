@@ -4,12 +4,14 @@
 //! as files/dirs) and a DB layer (vector search exposed via magic paths like
 //! `/search/<query>` and `/index/<key>`).
 
+pub mod auth;
 pub mod backend;
 pub mod cli;
 pub mod db;
 pub mod dispatcher;
 pub mod magic;
 
+pub use auth::AuthPolicy;
 pub use backend::RealFs;
 pub use cli::Cli;
 pub use db::{embedder, MemoryDb};

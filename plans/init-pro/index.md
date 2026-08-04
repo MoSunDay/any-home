@@ -2,7 +2,7 @@
 
 - **project**: init-pro（anyhome 首个实现周期）
 - **created**: 2026-07-19
-- **status**: planning → ready to execute（待切 act 模式从 TODO-01 开干）
+- **status**: done（TODO-01..07 全部完成）
 
 ## 关键技术决策（3 轮只读调研验证，附 file:line 证据）
 
@@ -25,13 +25,13 @@
 
 | ID | 标题 | 状态 | 依赖 |
 |----|------|------|------|
-| TODO-01 | 工作区骨架 + 依赖编译验证 | pending | - |
-| TODO-02 | 真实 FS 直通后端 | pending | TODO-01 |
-| TODO-03 | DB schema + MemoryDb + Embedder 抽象 | pending | TODO-01 |
-| TODO-04 | 真实 Embedder（语义模型接入） | **blocked-decision** | TODO-03 |
-| TODO-05 | 魔法路径路由（分流 + DB 查询路径） | pending | TODO-02, TODO-03 |
-| TODO-06 | 二进制 + CLI 配置 | pending | TODO-05 |
-| TODO-07 | e2e 脚本 + 使用文档 | pending | TODO-06 |
+| TODO-01 | 工作区骨架 + 依赖编译验证 | done | - |
+| TODO-02 | 真实 FS 直通后端 | done | TODO-01 |
+| TODO-03 | DB schema + MemoryDb + Embedder 抽象 | done | TODO-01 |
+| TODO-04 | 真实 Embedder（语义模型接入） | done | TODO-03 |
+| TODO-05 | 魔法路径路由（分流 + DB 查询路径） | done | TODO-02, TODO-03 |
+| TODO-06 | 二进制 + CLI 配置 | done | TODO-05 |
+| TODO-07 | e2e 脚本 + 使用文档 | done | TODO-06 |
 
 ```
 TODO-01 ─┬─> TODO-02 ──┐
@@ -41,14 +41,14 @@ TODO-01 ─┬─> TODO-02 ──┐
 ```
 
 ## 全局验收 gate
-- TODO-01..03、05..07 全 done（TODO-04 可留 blocked-decision）
+- TODO-01..07 全 done（真实 Embedder 已在 init-pro-2 TODO-08..13 交付）
 - `cargo build` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace` 全绿
 - **TODO-03 vector 冒烟测试必须非-ignore 且通过**（应对零 CI 保护：core libsql 的 vector 测试全 `#[ignore]`）
 - e2e 脚本（TODO-07）Linux 手动跑通，mount 命令带 `port=/mountport=/nolock`
 
 ## 已锁定的开放决策
 - **R4（魔法文件 readdir 可见性）= 可见**：根 `readdir` 拼入 `/search /index /where` 三个魔法目录条目。理由：README 定位「agent 用 ls 探索记忆」，隐藏接口违背产品语义。
-- **TODO-04 = blocked**：主线用 DummyEmbedder，真实语义模型延后到 TODO-06 之前决策。
+- **TODO-04 = done**：真实语义 Embedder 已在 init-pro-2（TODO-08..13）交付；init-pro 主线 DummyEmbedder 让 TODO-05 独立推进的历史决策已闭环。
 
 ## 环境就绪度（3 轮实测）
 - cc/gcc 11.4.0 ✓ | cmake 3.22.1（冗余）| make ✓ | pkg-config ✓ | rustup ✓ | rustc 1.85.0 已装 ✓ | network(crates.io) ✓ | cached 446 crates

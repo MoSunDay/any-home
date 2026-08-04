@@ -52,6 +52,8 @@ PORT="${PORT:-11111}"
 HOST="127.0.0.1"
 EXPORT="/"
 MNT="${ANYHOME_MNT:-/mnt/anyhome}"
+MNT2="${ANYHOME_MNT2:-/mnt/anyhome-auth}"
+T=$'\t'   # literal tab for grep assertions on "<key>\t<text>" output
 EMBEDDER="${ANYHOME_EMBEDDER:-dummy}"
 WORK="$(mktemp -d -t anyhome-e2e-XXXXXX)"
 
@@ -64,7 +66,9 @@ MOUNT_OPTS="vers=3,tcp,nolock,noacl,port=${PORT},mountport=${PORT}"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qdrant--all-MiniLM-L6-v2-onnx"
 
 cleanup() {
-    if mountpoint -q "$MNT" 2>/dev/null; then umount "$MNT" || true; fi
+    if mountpoint -q "$MNT2" 2>/dev/null; then umount -f "$MNT2" 2>/dev/null || true; fi
+    if mountpoint -q "$MNT" 2>/dev/null; then umount -f "$MNT" 2>/dev/null || true; fi
+    if [ -n "${AUTH_PID:-}" ]; then kill "$AUTH_PID" 2>/dev/null || true; fi
     if [ -n "${SERVER_PID:-}" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi
     rm -rf "$WORK"
 }
@@ -154,6 +158,18 @@ if ! grep -q "^second	" "$WHERE_QUERY"; then
     echo "FAIL: expected key 'second' in /where results"; exit 1
 fi
 
+# ---- /where/key:<prefix> prefix filtering -----------------------------------
+echo "==> /where/key:gre (prefix filter — only keys starting with 'gre')"
+PREFIX_QUERY="$MNT/where/key:gre"
+cat "$PREFIX_QUERY"
+echo "==> asserting /where/key:gre returns 'greeting' but excludes 'second'"
+if ! grep -q "^greeting${T}" "$PREFIX_QUERY"; then
+    echo "FAIL: expected 'greeting' in /where/key:gre results"; exit 1
+fi
+if grep -q "^second${T}" "$PREFIX_QUERY"; then
+    echo "FAIL: 'second' must not appear in /where/key:gre (no 'gre' prefix)"; exit 1
+fi
+
 echo "==> ls /"
 ls -la "$MNT"
 
@@ -195,4 +211,84 @@ if ! grep -q "^greeting	agent B memory$" "$B_QUERY"; then
     echo "FAIL: expected 'greeting<TAB>agent B memory' in agent B search"; exit 1
 fi
 
-echo "PASS: index -> search + where + agent namespace isolation works over NFSv3"
+# ---- /agents/<id>/where agent-scoped FTS ------------------------------------
+echo "==> /agents/botA/where/agent (agent-scoped FTS isolation)"
+A_WHERE="$MNT/agents/botA/where/agent"
+cat "$A_WHERE"
+echo "==> asserting botA /where finds own content but not botB's"
+if ! grep -q "^greeting${T}agent A memory" "$A_WHERE"; then
+    echo "FAIL: expected 'agent A memory' in botA scoped /where"; exit 1
+fi
+if grep -q "agent B memory" "$A_WHERE"; then
+    echo "FAIL: botA scoped /where leaked botB content"; exit 1
+fi
+
+# ---- restart persistence -----------------------------------------------------
+echo "==> testing persistence: unmount -> restart server -> remount"
+umount -f "$MNT" 2>/dev/null || true
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null || true
+
+echo "==> restarting anyhome with same db-path ($WORK/mem.db)"
+"${SERVER_ENV[@]}" "$BIN" --fs-root "$WORK/fs" --db-path "$WORK/mem.db" \
+    --addr "${HOST}:${PORT}" --export "$EXPORT" --embedder "$EMBEDDER" \
+    > "$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+if ! timeout 20 bash -c "until (echo > /dev/tcp/${HOST}/${PORT}) 2>/dev/null; do sleep 0.2; done"; then
+    echo "server did not restart; log:"; cat "$WORK/server.log"; exit 1
+fi
+
+echo "==> remounting after restart"
+mount.nfs -o "$MOUNT_OPTS" "${HOST}:${EXPORT}" "$MNT"
+
+echo "==> asserting memories persisted across restart"
+RESTART_WHERE="$MNT/where/hello"
+cat "$RESTART_WHERE"
+if ! grep -q "^greeting${T}" "$RESTART_WHERE"; then
+    echo "FAIL: 'greeting' missing from /where after restart — persistence broken"; exit 1
+fi
+if ! grep -q "^second${T}" "$RESTART_WHERE"; then
+    echo "FAIL: 'second' missing from /where after restart — persistence broken"; exit 1
+fi
+
+# ---- auth live test (soft AUTH_SYS authorization) ---------------------------
+AUTH_PORT=$((PORT + 1))
+echo "==> starting auth-enabled anyhome on ${HOST}:${AUTH_PORT} (--agent-uid botA:1001)"
+mkdir -p "$WORK/fs-auth"
+"${SERVER_ENV[@]}" "$BIN" --fs-root "$WORK/fs-auth" --db-path "$WORK/auth.db" \
+    --addr "${HOST}:${AUTH_PORT}" --export "$EXPORT" --embedder "$EMBEDDER" \
+    --agent-uid "botA:1001" \
+    > "$WORK/auth-server.log" 2>&1 &
+AUTH_PID=$!
+if ! timeout 20 bash -c "until (echo > /dev/tcp/${HOST}/${AUTH_PORT}) 2>/dev/null; do sleep 0.2; done"; then
+    echo "auth server did not come up; log:"; cat "$WORK/auth-server.log"; exit 1
+fi
+
+echo "==> mounting auth-enabled export at $MNT2"
+mkdir -p "$MNT2"
+MOUNT_OPTS2="vers=3,tcp,nolock,noacl,port=${AUTH_PORT},mountport=${AUTH_PORT}"
+mount.nfs -o "$MOUNT_OPTS2" "${HOST}:${EXPORT}" "$MNT2"
+
+# The mount process runs as root (uid 0). Since uid 0 cannot be bound to an
+# agent (it denotes anonymous/AUTH_NULL), the caller is anonymous and confined
+# to the public default agent — exactly what we verify below.
+echo "==> asserting default agent stays public for anonymous caller"
+echo "open-data" > "$MNT2/index/public"
+AUTH_SEARCH="$MNT2/search/open-data"
+cat "$AUTH_SEARCH"
+if ! grep -q "^public${T}open-data" "$AUTH_SEARCH"; then
+    echo "FAIL: default agent must stay public even under auth"; exit 1
+fi
+
+echo "==> asserting anonymous caller CANNOT reach /agents/botA/ (NFS3ERR_ACCES)"
+if ls "$MNT2/agents/botA/" >/dev/null 2>&1; then
+    echo "FAIL: anonymous caller reached /agents/botA/ — auth isolation broken"; exit 1
+fi
+echo "    -> access denied as expected"
+
+echo "==> asserting /agents/ listing hides botA from unauthorized caller"
+if ls "$MNT2/agents/" 2>/dev/null | grep -q "botA"; then
+    echo "FAIL: /agents/ listing leaked botA to unauthorized caller"; exit 1
+fi
+
+echo "PASS: index/search/where + where-prefix + agent-where + persistence + auth live all green over NFSv3"

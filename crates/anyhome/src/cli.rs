@@ -71,6 +71,21 @@ pub struct Cli {
     /// fastembed`, which pins dim=384). Must match any pre-existing db file.
     #[arg(long, default_value_t = crate::db::DUMMY_DIM)]
     pub dim: usize,
+
+    /// Register an agent credential, binding `agent_id` to a caller AUTH_SYS
+    /// `uid` (`--agent-uid botA:1001`). Repeatable. When at least one credential
+    /// is registered (here or via `--agent-creds`) authorization is *enabled*:
+    /// a caller's uid must be bound to an agent_id to access
+    /// `/agents/<id>/...`. With no credentials configured at all, auth is
+    /// disabled (identical to prior behavior). Soft auth only — see README.
+    #[arg(long, value_name = "ID:UID", value_parser = crate::auth::AgentCred::parse_clap)]
+    pub agent_uid: Vec<crate::auth::AgentCred>,
+
+    /// Path to a credentials file (one `<agent_id>:<uid>` per line; `#`
+    /// comments and blank lines ignored). Merged with `--agent-uid`. See
+    /// `--agent-uid` for the auth model.
+    #[arg(long, value_name = "FILE")]
+    pub agent_creds: Option<PathBuf>,
 }
 
 /// Extract the port portion of an `ip:port` string (for log lines).
