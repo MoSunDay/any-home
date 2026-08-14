@@ -218,7 +218,7 @@ anyhome/
 │   │   ├── magic.rs        # magic-path encoding, fileid categorization, MagicRegistry
 │   │   ├── backend/        # RealFs: on-disk filesystem layer
 │   │   └── db/             # MemoryDb (libsql), embedder trait and implementations
-│   └── tests/              # integration tests (11 files)
+│   └── tests/              # integration tests (12 files)
 ├── link_repos/             # read-only embedded dependencies (gitignored)
 │   ├── nfsserve/           # user-mode NFSv3 engine (with anyhome fork patch)
 │   └── libsql/             # SQLite fork with native vector retrieval

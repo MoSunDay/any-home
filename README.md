@@ -243,7 +243,7 @@ anyhome/
 │   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
 │   │   ├── backend/        # RealFs：磁盘文件系统层
 │   │   └── db/             # MemoryDb（libsql）、embedder trait 及其实现
-│   └── tests/              # 集成测试（11 个文件）
+│   └── tests/              # 集成测试（12 个文件）
 ├── link_repos/             # 只读内嵌依赖（gitignored）
 │   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
 │   └── libsql/             # 原生支持向量检索的 SQLite 衍生分支
