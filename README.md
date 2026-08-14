@@ -38,15 +38,20 @@ agent 可以 `ls` 浏览、`cat` 读取、`echo` 写入、`mkdir` 分类，就�
 
 - **向量检索**：`cat /search/<query>` —— 向量 KNN 检索，路径即 query，文件内容为结果
   （每行 `key<TAB>text`）。
+- **检索条数可控**：`cat /search_k<N>/<query>` —— 同 `/search` 但显式指定 KNN top-k
+  （N 收敛到 1..=64；`/search` 默认 16）。
 - **写入索引**：`echo "text" > /index/<key>` —— 写入即嵌入并 upsert 进向量库。
 - **全文检索**：`cat /where/<word>` —— FTS5 全文 MATCH 检索。
 - **键前缀过滤**：`cat /where/key:<prefix>` —— 按 key 前缀过滤。
+- **畸形 FTS 查询**：`cat /where/<cond>` 语法错误时返回首行
+  `# error: invalid FTS query: <cond>`（合法查询输出不变）。
 
 ### 多 agent 命名空间隔离
 
 每个 agent 拥有独立的魔法路径命名空间：
 
 - `/agents/<id>/search/<q>` —— 仅在 agent `<id>` 范围内做 KNN
+- `/agents/<id>/search_k<N>/<q>` —— agent 范围内 KNN，top-k = N
 - `/agents/<id>/index/<key>` —— 写入归入 agent `<id>`
 - `/agents/<id>/where/<cond>` —— 仅在 agent `<id>` 范围内做 FTS / 前缀
 - 首次写入即隐式创建 agent
@@ -125,6 +130,9 @@ echo "hello anyhome" > /mnt/anyhome/index/greeting
 cat /mnt/anyhome/search/hello
 # => greeting	hello anyhome
 
+# 同上，但显式指定 KNN top-k
+cat /mnt/anyhome/search_k4/hello   # 同上，但只返回 top-4
+
 # FTS5 全文检索
 cat /mnt/anyhome/where/hello
 # => greeting	hello anyhome
@@ -147,8 +155,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 87 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 91 个测试
+cargo test                              # 102 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 106 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -187,17 +195,18 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **87 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **91 个测试通过**
+- `cargo test` = **102 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **106 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
 
 - **只读内嵌依赖**：`link_repos/{nfsserve,libsql}` 已钉版本，通过 `scripts/bootstrap.sh` 可复现构建
 - **NFS 后端分发**：`AnyHomeFs` 把魔法路径路由到 DB 层，其余路由到文件系统层（`RealFs`）
-- **魔法路径**：`/search/<q>`（向量 KNN）、`/index/<key>`（写入 = 嵌入 + upsert）、
-  `/where/<word>`（FTS5 MATCH）/ `/where/key:<prefix>`（key 前缀过滤）。`/search` 与
-  `/where` 是只读查询视图（写入 / setattr 返回 `ROFS`）
+- **魔法路径**：`/search/<q>`（向量 KNN）、`/search_k<N>/<q>`（同 `/search`，KNN top-k = N，
+  收敛到 1..=64）、`/index/<key>`（写入 = 嵌入 + upsert）、
+  `/where/<word>`（FTS5 MATCH）/ `/where/key:<prefix>`（key 前缀过滤）。`/search`、
+  `/search_k` 与 `/where` 是只读查询视图（写入 / setattr 返回 `ROFS`）
 - **多 agent 命名空间隔离**：`/agents/<id>/{search,index,where}`，拥有独立的 DB 键空间与检索范围
 - **Agent 身份鉴权（soft auth）**：可选的 `--agent-uid` / `--agent-creds`；AUTH_SYS uid 绑定
 - **向量检索**：libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，余弦距离 KNN
@@ -212,7 +221,10 @@ botB:1002
   文件型 DB 使用 `WAL` + `synchronous=FULL`，每个已提交写均 fsync、崩溃后存活；内存写缓冲仅用于偏移拼接，
   且上限 256 条目（超出按任意顺序淘汰，淘汰安全——DB 始终为权威来源）。
 - **仅 soft auth**：NFSv3 AUTH_SYS 的 `uid`/`gid` 由客户端自报、**极易伪造**——本机制仅防
-  误操作与意外串扰，**不构成对抗性安全**。`getattr`/`setattr`（纯元数据）不做鉴权。
+  误操作与意外串扰，**不构成对抗性安全**。`/index` 文件的元数据（含真实字节大小）自
+  init-pro-7 起随 agent 鉴权（未授权 `getattr`/`setattr` 返回 `ACCES`，关闭「大小 oracle」）；
+  **目录与真实文件系统元数据不做鉴权**（对 NFS 客户端属性缓存友好；沙箱无 mount.nfs，
+  真实挂载下的客户端缓存交互未做 live 回归）。
   如需强鉴权，应在 TLS/mTLS 终止的网络前置，或升级至 RPCSEC_GSS/Kerberos。
 - **root（uid 0）无法安全使用 agent 鉴权**：AUTH_SYS 下 `uid 0` 同时表示「匿名调用方」（AUTH_NULL）与「真实 root」，二者不可区分。
   因此 `--agent-uid` / `--agent-creds` 会**拒绝** `uid 0` 的绑定——若允许，所有匿名调用方将获得该 agent 的访问权。agent 进程须以非 root uid 运行。
@@ -231,7 +243,7 @@ anyhome/
 │   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
 │   │   ├── backend/        # RealFs：磁盘文件系统层
 │   │   └── db/             # MemoryDb（libsql）、embedder trait 及其实现
-│   └── tests/              # 集成测试（10 个文件）
+│   └── tests/              # 集成测试（11 个文件）
 ├── link_repos/             # 只读内嵌依赖（gitignored）
 │   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
 │   └── libsql/             # 原生支持向量检索的 SQLite 衍生分支

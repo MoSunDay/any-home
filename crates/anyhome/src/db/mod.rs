@@ -513,26 +513,33 @@ impl MemoryDb {
     /// - `key:<prefix>` — filter memories whose key starts with `<prefix>`
     ///   (parameterized `LIKE`, never string-interpolated).
     /// - anything else — an FTS5 MATCH expression run against `memories_fts`
-    ///   (bound as a parameter; malformed expressions simply yield no rows).
+    ///   (bound as a parameter, so this stays injection-safe).
     ///
-    /// Returns `(key, text)` rows ordered by relevance (FTS) or key (prefix).
-    /// An empty/whitespace condition returns no rows rather than erroring.
+    /// Returns [`WhereOutcome::Rows`] ordered by relevance (FTS) or key
+    /// (prefix). An empty/whitespace condition returns no rows rather than
+    /// erroring. A malformed MATCH expression returns
+    /// [`WhereOutcome::InvalidFts`] instead of failing opaquely, so callers
+    /// can tell "no results" from "bad query".
     pub async fn where_search(
         &self,
         agent_id: &str,
         cond: &str,
         k: i64,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<WhereOutcome> {
         let cond = cond.trim();
         if cond.is_empty() {
-            return Ok(Vec::new());
+            return Ok(WhereOutcome::Rows(Vec::new()));
         }
         if let Some(prefix) = cond.strip_prefix("key:") {
-            return self.key_prefix_search(agent_id, prefix.trim(), k).await;
+            let rows = self.key_prefix_search(agent_id, prefix.trim(), k).await?;
+            return Ok(WhereOutcome::Rows(rows));
         }
         // FTS5 MATCH. A bound parameter keeps this injection-safe even though
-        // the expression syntax is user-controlled; bad queries -> no rows.
-        let mut rows = self
+        // the expression syntax is user-controlled. Malformed expressions
+        // surface as SqliteFailure at fetch time and are classified below —
+        // the surrounding SQL is fixed, so those messages can only originate
+        // from the user-supplied MATCH value.
+        let mut rows = match self
             .conn
             .query(
                 "SELECT m.key, m.text FROM memories_fts f \
@@ -542,12 +549,19 @@ impl MemoryDb {
                 params![cond, agent_id, k],
             )
             .await
-            .context("fts5 match query")?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await.context("fetch where row")? {
-            out.push((row.get_key()?, row.get_text()?));
+        {
+            Ok(rows) => rows,
+            Err(e) => return classify_fts_error(e, cond),
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        loop {
+            match rows.next().await {
+                Ok(Some(row)) => out.push((row.get_key()?, row.get_text()?)),
+                Ok(None) => break,
+                Err(e) => return classify_fts_error(e, cond),
+            }
         }
-        Ok(out)
+        Ok(WhereOutcome::Rows(out))
     }
 
     async fn key_prefix_search(
@@ -574,6 +588,35 @@ impl MemoryDb {
         }
         Ok(out)
     }
+}
+
+/// Distinguishable outcome of a `/where` query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WhereOutcome {
+    /// Matching `(key, text)` rows.
+    Rows(Vec<(String, String)>),
+    /// The user-supplied FTS5 MATCH expression is malformed; carries the
+    /// offending condition. Rendered by the dispatcher as a `# error:` line.
+    InvalidFts(String),
+}
+
+/// Classify an FTS5 fetch failure: SQLite messages that can only be caused by
+/// the user-supplied MATCH expression become [`WhereOutcome::InvalidFts`];
+/// anything else is a real database error and is propagated. The message
+/// shapes were verified empirically against bundled libsql SQLite:
+/// `fts5: syntax error near ...`, `unterminated string`,
+/// `unknown special query: ...`.
+fn classify_fts_error(e: libsql::Error, cond: &str) -> Result<WhereOutcome> {
+    if let libsql::Error::SqliteFailure(_, msg) = &e {
+        let m = msg.to_lowercase();
+        let user_caused = m.starts_with("fts5:")
+            || m.starts_with("unterminated string")
+            || m.starts_with("unknown special query");
+        if user_caused {
+            return Ok(WhereOutcome::InvalidFts(cond.to_string()));
+        }
+    }
+    Err(e).context("fts5 match query")
 }
 
 /// Encode a slice as the JSON array string libSQL's `vector()` accepts:

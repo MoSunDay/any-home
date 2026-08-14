@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use nfsserve::nfs::{filename3, nfsstat3, sattr3};
+use nfsserve::nfs::{fileid3, filename3, nfsstat3, sattr3};
 use nfsserve::vfs::NFSFileSystem;
 use tempfile::tempdir;
 
@@ -229,4 +229,143 @@ fn magic_file_id_agent_scoped_no_collision() {
         magic_file_id(CAT_INDEX, &scoped_name("agentA", "key2")),
         "different keys under the same agent must map to distinct fileids"
     );
+}
+
+// ---- /search_k<N> explicit top-k (TODO-42, init-pro-7) ----
+
+/// Read a magic file fully via repeated 4096-byte reads.
+async fn read_all(fs: &AnyHomeFs, id: fileid3) -> String {
+    let mut out = Vec::new();
+    let mut off = 0u64;
+    loop {
+        let (mut chunk, eof) = fs.read(id, off, 4096).await.unwrap();
+        out.append(&mut chunk);
+        if eof {
+            return String::from_utf8_lossy(&out).into_owned();
+        }
+        off += 4096;
+    }
+}
+
+/// `/search_k<N>/<query>` caps the result at N rows while `/search` keeps
+/// its DEFAULT_K=16 behavior (all 6 docs here).
+#[tokio::test]
+async fn search_k_limits_knn_results() {
+    let fs = make().await;
+    for i in 0..6 {
+        index_doc(&fs, &format!("k{i}"), format!("shared token doc {i}").as_bytes()).await;
+    }
+    let root = fs.root_dir();
+
+    let k2_dir = fs.lookup(root, &nm(b"search_k2")).await.unwrap();
+    let q2 = fs.lookup(k2_dir, &nm(b"shared token")).await.unwrap();
+    let body2 = read_all(&fs, q2).await;
+    let lines2: Vec<&str> = body2.lines().collect();
+    assert_eq!(lines2.len(), 2, "search_k2 caps at 2: {lines2:?}");
+
+    let k4_dir = fs.lookup(root, &nm(b"search_k4")).await.unwrap();
+    let q4 = fs.lookup(k4_dir, &nm(b"shared token")).await.unwrap();
+    assert_eq!(read_all(&fs, q4).await.lines().count(), 4);
+
+    // Backward compatibility: plain /search returns everything (<= DEFAULT_K).
+    let search_dir = fs.lookup(root, &nm(b"search")).await.unwrap();
+    let q = fs.lookup(search_dir, &nm(b"shared token")).await.unwrap();
+    assert_eq!(read_all(&fs, q).await.lines().count(), 6);
+}
+
+/// N is clamped to 1..=64; degenerate spellings stay outside the family and
+/// fall through to the real FS (NOENT), and search_k dirs are not enumerable.
+#[tokio::test]
+async fn search_k_clamping_and_rejection() {
+    let fs = make().await;
+    index_doc(&fs, "a", b"alpha beta").await;
+    let root = fs.root_dir();
+
+    // Clamped: search_k999 behaves like search_k64; search_k1 pins k=1.
+    let big = fs.lookup(root, &nm(b"search_k999")).await.unwrap();
+    assert!(fs.getattr(big).await.is_ok(), "clamped k dir is a valid dir");
+    let one = fs.lookup(root, &nm(b"search_k1")).await.unwrap();
+    let q1 = fs.lookup(one, &nm(b"alpha")).await.unwrap();
+    assert_eq!(read_all(&fs, q1).await.lines().count(), 1, "k=1 returns exactly one row");
+
+    // Not the family: no digits, k0, non-digit suffix -> real FS miss.
+    for bad in ["search_k", "search_k0", "search_kx", "search_k-2"] {
+        assert!(
+            matches!(fs.lookup(root, &nm(bad.as_bytes())).await, Err(nfsstat3::NFS3ERR_NOENT)),
+            "{bad} is not a search_k dir"
+        );
+    }
+
+    // Root readdir advertises only the fixed magic dirs.
+    let res = fs.readdir(root, 0, 128).await.unwrap();
+    let names: Vec<&[u8]> = res.entries.iter().map(|e| e.name.as_slice()).collect();
+    assert!(names.iter().all(|n| !n.starts_with(b"search_k")), "not enumerable");
+    // Nor does the k-dir itself list query files as enumerable DB state.
+    let inside = fs.readdir(big, 0, 128).await.unwrap();
+    assert!(inside.entries.is_empty(), "k dirs carry no enumerable DB rows");
+}
+
+/// `/search_k<N>/<q>` and `/search/<q>` resolve to distinct fileids and both
+/// stay readable — no cross-contamination of the registry entries.
+#[tokio::test]
+async fn search_k_fileids_do_not_collide_with_search() {
+    let fs = make().await;
+    index_doc(&fs, "greet", b"hello anyhome").await;
+    let root = fs.root_dir();
+
+    let search_dir = fs.lookup(root, &nm(b"search")).await.unwrap();
+    let plain = fs.lookup(search_dir, &nm(b"hello anyhome")).await.unwrap();
+    let k8_dir = fs.lookup(root, &nm(b"search_k8")).await.unwrap();
+    let salted = fs.lookup(k8_dir, &nm(b"hello anyhome")).await.unwrap();
+    assert_ne!(plain, salted, "k-salted fileid differs from /search fileid");
+
+    assert!(read_all(&fs, plain).await.contains("greet"));
+    assert!(read_all(&fs, salted).await.contains("greet"));
+    // ...including across k values.
+    let k4_dir = fs.lookup(root, &nm(b"search_k4")).await.unwrap();
+    let other = fs.lookup(k4_dir, &nm(b"hello anyhome")).await.unwrap();
+    assert_ne!(other, salted);
+}
+
+/// Multi-segment queries (query text containing '/') still parse inside a
+/// search_k dir exactly like inside /search — only the leading `search_k<N>`
+/// component is special.
+#[tokio::test]
+async fn search_k_accepts_slash_containing_queries() {
+    let fs = make().await;
+    index_doc(&fs, "path", b"note/a/b").await;
+    let root = fs.root_dir();
+
+    let k2 = fs.lookup(root, &nm(b"search_k2")).await.unwrap();
+    // NFS lookup is per-component: "note" then "a" then "b" would need dirs —
+    // so like /search, a slashed query is addressed via percent-encoding.
+    let q = fs.lookup(k2, &nm(b"note%2Fa%2Fb")).await.unwrap();
+    assert!(read_all(&fs, q).await.contains("path"));
+}
+
+// ---- /where error observability (TODO-43, init-pro-7) ----
+
+/// A malformed FTS condition reads back as a `# error:` first line instead
+/// of an opaque I/O error — agents can tell "no results" from "bad query".
+#[tokio::test]
+async fn where_malformed_fts_renders_error_line() {
+    let fs = make().await;
+    index_doc(&fs, "rust", b"The Rust language focuses on safety").await;
+    let root = fs.root_dir();
+    let where_dir = fs.lookup(root, &nm(b"where")).await.unwrap();
+
+    let bad = fs.lookup(where_dir, &nm(b"rust OR")).await.unwrap();
+    let body = read_all(&fs, bad).await;
+    assert!(
+        body.starts_with("# error: invalid FTS query: rust OR\n"),
+        "got: {body:?}"
+    );
+
+    // A valid-but-unmatched query is still plain (empty) rows, not an error.
+    let miss = fs.lookup(where_dir, &nm(b"zzz_nomatch")).await.unwrap();
+    assert_eq!(read_all(&fs, miss).await, "");
+
+    // And a hit keeps the exact `key<TAB>text` line format.
+    let hit = fs.lookup(where_dir, &nm(b"rust")).await.unwrap();
+    assert_eq!(read_all(&fs, hit).await, "rust\tThe Rust language focuses on safety\n");
 }

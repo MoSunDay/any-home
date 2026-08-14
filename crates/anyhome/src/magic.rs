@@ -41,8 +41,15 @@ pub const CAT_AGENT_SEARCH: u8 = 8;
 pub const CAT_AGENT_INDEX: u8 = 9;
 pub const CAT_AGENT_WHERE: u8 = 10;
 
+/// `/search_k<N>` directory (global or agent-scoped): like `/search` but the
+/// KNN top-k is `N` instead of [`DEFAULT_K`]. `>= CAT_AGENT`, so fileids with
+/// this category are directories to [`is_magic_dir`].
+pub const CAT_SEARCH_K_DIR: u8 = 11;
+
 /// Default number of neighbors returned by `/search`.
 pub const DEFAULT_K: i64 = 16;
+/// Upper bound for `/search_k<N>` (larger N are clamped down to it).
+pub const MAX_K: i64 = 64;
 /// Reported size for synthetic files (read returns the real length).
 pub const MAGIC_FILE_SIZE: u64 = 1 << 20; // 1 MiB
 
@@ -67,6 +74,37 @@ pub fn magic_category(id: fileid3) -> u8 {
 /// The NUL separator avoids boundary ambiguity between agent_id and name.
 pub fn scoped_name(agent_id: &str, name: &str) -> String {
     format!("{agent_id}\x00{name}")
+}
+
+/// Parse a `search_k<N>` directory name into a clamped `N` in `1..=MAX_K`.
+/// Returns `None` for anything else (no digits, `N == 0`, or a non-numeric
+/// suffix), so those names keep falling through to the real filesystem.
+pub fn parse_search_k(name: &[u8]) -> Option<i64> {
+    let digits = name.strip_prefix(b"search_k")?;
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let n = std::str::from_utf8(digits).ok()?.parse::<u64>().ok()?;
+    if n == 0 {
+        return None; // k=0 is meaningless: stay outside the family
+    }
+    Some((n as i64).clamp(1, MAX_K))
+}
+
+/// Synthetic directory id for `/search_k<N>` (agent-scoped when `agent_id`
+/// is non-empty). Not enumerable via readdir; clients reach it by lookup.
+pub fn search_k_dir_id(agent_id: &str, k: i64) -> fileid3 {
+    magic_file_id(CAT_SEARCH_K_DIR, &format!("{agent_id}\x00k{k}"))
+}
+
+/// Scoped name for a search query opened via `/search_k<N>`: k-salted so its
+/// fileid never collides with `/search/<query>` or another N. (The read path
+/// recovers `k` from the registry entry, and distinct fileids keep those
+/// entries distinct.) Like [`scoped_name`], a path component containing an
+/// embedded NUL could theoretically alias the two encodings — same accepted
+/// ambiguity class as [`scoped_name`] itself.
+pub fn search_scoped_name(agent_id: &str, k: i64, query: &str) -> String {
+    format!("{agent_id}\x00k{k}\x00{query}")
 }
 
 pub fn magic_file_id(cat: u8, scoped_name: &str) -> fileid3 {
@@ -169,6 +207,9 @@ pub struct MagicEntry {
     pub agent_id: String,
     pub name: String,
     pub category: u8,
+    /// KNN top-k for CAT_SEARCH files opened via `/search_k<N>`.
+    /// [`DEFAULT_K`] everywhere else; unused for other categories.
+    pub k: i64,
 }
 
 impl MagicEntry {
@@ -177,6 +218,15 @@ impl MagicEntry {
             agent_id: agent_id.to_string(),
             name: name.to_string(),
             category,
+            k: DEFAULT_K,
+        }
+    }
+
+    /// Like [`MagicEntry::new`] with an explicit KNN top-k.
+    pub fn with_k(agent_id: &str, name: &str, category: u8, k: i64) -> Self {
+        MagicEntry {
+            k,
+            ..MagicEntry::new(agent_id, name, category)
         }
     }
 }

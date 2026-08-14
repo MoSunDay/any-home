@@ -2,12 +2,18 @@
 //! real on-disk backend ([`RealFs`]) or to the DB layer via magic paths.
 //!
 //! ## Global magic paths (backward-compatible, default agent `agent_id = ""`)
-//! - `/search/<query>` — read returns KNN results for `<query>` as text.
+//! - `/search/<query>` — read returns KNN results for `<query>` as text
+//!   (top-k = 16, [`DEFAULT_K`]).
+//! - `/search_k<N>/<query>` — like `/search` with an explicit top-k
+//!   (`N` clamped to 1..=64). Not enumerated by readdir.
 //! - `/index/<key>`    — write embeds and upserts the written text under `<key>`.
 //! - `/where/<cond>`   — read returns FTS5 full-text matches, or `key:<prefix>`.
+//!   A malformed FTS expression yields a first line `# error: invalid FTS
+//!   query ...` instead of an opaque I/O error.
 //!
 //! ## Agent-scoped magic paths (multi-agent namespace isolation)
 //! - `/agents/<id>/search/<query>` — KNN scoped to agent `<id>`.
+//! - `/agents/<id>/search_k<N>/<query>` — explicit top-k, scoped.
 //! - `/agents/<id>/index/<key>`    — write scoped to agent `<id>`.
 //! - `/agents/<id>/where/<cond>`   — FTS/prefix scoped to agent `<id>`.
 //!
@@ -23,11 +29,13 @@ use crate::auth::{AuthPolicy, CallerCred};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 use crate::backend::{RealFs, ROOT_ID};
-use crate::db::{Embedder, MemoryDb};
+use crate::db::{Embedder, MemoryDb, WhereOutcome};
 use crate::magic::{
     percent_decode, slice_read, magic_attr, magic_attr_sized, magic_category, magic_file_id,
-    scoped_name, agent_dir_base_cat, is_magic, is_magic_dir, MagicEntry, MagicRegistry,
-    CAT_AGENT, CAT_INDEX, CAT_SEARCH, CAT_WHERE, DEFAULT_K,
+    scoped_name, agent_dir_base_cat, is_magic, is_magic_dir,
+    parse_search_k, search_k_dir_id, search_scoped_name,
+    MagicEntry, MagicRegistry,
+    CAT_AGENT, CAT_INDEX, CAT_SEARCH, CAT_SEARCH_K_DIR, CAT_WHERE, DEFAULT_K,
     INDEX_DIR, SEARCH_DIR, WHERE_DIR, AGENTS_DIR,
 };
 
@@ -81,11 +89,13 @@ impl AnyHomeFs {
 
     // ---- DB-backed operations (all scoped by agent_id) ----
 
-    /// Embed `query` and return up to [`DEFAULT_K`] KNN rows as `<key>\t<text>\n`.
+    /// Embed `query` and return up to `k` KNN rows as `<key>\t<text>\n`.
+    /// `k` comes from the entry ([`DEFAULT_K`] for plain `/search`).
     async fn run_search(
         &self,
         agent_id: &str,
         query: &str,
+        k: i64,
     ) -> std::result::Result<Vec<u8>, nfsstat3> {
         let emb = self
             .embedder
@@ -94,7 +104,7 @@ impl AnyHomeFs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let rows = self
             .db
-            .search(agent_id, &emb, DEFAULT_K)
+            .search(agent_id, &emb, k)
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         let mut out = String::new();
@@ -122,20 +132,31 @@ impl AnyHomeFs {
             .map_err(|_| nfsstat3::NFS3ERR_IO)
     }
 
-    /// Full-text / prefix query for `/where/<cond>` -> `<key>\t<text>\n` lines.
+    /// Full-text / prefix query for `/where/<cond>` -> `<key>\t<text>\n`
+    /// lines. A malformed FTS condition renders as a single first line
+    /// `# error: invalid FTS query ...`: NFS READ has no errno channel for
+    /// per-call syntax problems, and a text marker lets agents distinguish
+    /// "no results" from "query written wrong" (valid queries are unchanged).
     async fn run_where(
         &self,
         agent_id: &str,
         cond: &str,
     ) -> std::result::Result<Vec<u8>, nfsstat3> {
-        let rows = self
+        let mut out = String::new();
+        match self
             .db
             .where_search(agent_id, cond, DEFAULT_K)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        let mut out = String::new();
-        for (key, text) in rows {
-            out.push_str(&format!("{}\t{}\n", key, text));
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+        {
+            WhereOutcome::Rows(rows) => {
+                for (key, text) in rows {
+                    out.push_str(&format!("{}\t{}\n", key, text));
+                }
+            }
+            WhereOutcome::InvalidFts(bad) => {
+                out.push_str(&format!("# error: invalid FTS query: {bad}\n"));
+            }
         }
         Ok(out.into_bytes())
     }
@@ -163,7 +184,36 @@ impl AnyHomeFs {
             SEARCH_DIR => Some(CAT_SEARCH),
             INDEX_DIR => Some(CAT_INDEX),
             WHERE_DIR => Some(CAT_WHERE),
-            _ => agent_dir_base_cat(magic_category(dirid)),
+            _ => match magic_category(dirid) {
+                CAT_SEARCH_K_DIR => Some(CAT_SEARCH),
+                c => agent_dir_base_cat(c),
+            },
+        }
+    }
+
+    /// Resolve the `(fileid, registry entry)` for a magic file named `name`
+    /// inside magic dir `dirid` (whose file category is `cat` and owning agent
+    /// is `agent_id`). `/search_k<N>` dirs salt the scoped name with `k` so
+    /// their fileids never collide with `/search/<query>` (or another N), and
+    /// carry `k` in the entry for the read path.
+    fn magic_file_in(
+        &self,
+        dirid: fileid3,
+        agent_id: &str,
+        name: &str,
+        cat: u8,
+    ) -> (fileid3, MagicEntry) {
+        if cat == CAT_SEARCH && magic_category(dirid) == CAT_SEARCH_K_DIR {
+            let k = self
+                .magic
+                .get_entry(dirid)
+                .map(|e| e.k)
+                .unwrap_or(DEFAULT_K);
+            let id = magic_file_id(cat, &search_scoped_name(agent_id, k, name));
+            (id, MagicEntry::with_k(agent_id, name, cat, k))
+        } else {
+            let id = magic_file_id(cat, &scoped_name(agent_id, name));
+            (id, MagicEntry::new(agent_id, name, cat))
         }
     }
 
@@ -187,6 +237,12 @@ impl AnyHomeFs {
         }
         match magic_category(id) {
             CAT_AGENT => AGENTS_DIR,
+            CAT_SEARCH_K_DIR => match self.magic.get_entry(id) {
+                Some(e) if !e.agent_id.is_empty() => {
+                    magic_file_id(CAT_AGENT, &e.agent_id)
+                }
+                _ => ROOT_ID,
+            },
             c if agent_dir_base_cat(c).is_some() => self
                 .magic
                 .get_entry(id)
@@ -267,6 +323,13 @@ impl NFSFileSystem for AnyHomeFs {
                 b"agents" => return Ok(AGENTS_DIR),
                 _ => {}
             }
+            // `/search_k<N>`: same KNN surface with an explicit top-k.
+            if let Some(k) = parse_search_k(filename.as_slice()) {
+                let id = search_k_dir_id("", k);
+                self.magic
+                    .register(id, MagicEntry::with_k("", "search", CAT_SEARCH_K_DIR, k));
+                return Ok(id);
+            }
         }
 
         // /agents level: any name becomes an agent container dir.
@@ -288,6 +351,14 @@ impl NFSFileSystem for AnyHomeFs {
                 .map(|e| e.agent_id)
                 .unwrap_or_default();
             self.require_agent(&agent_id)?;
+            if let Some(k) = parse_search_k(filename.as_slice()) {
+                let id = search_k_dir_id(&agent_id, k);
+                self.magic.register(
+                    id,
+                    MagicEntry::with_k(&agent_id, "search", CAT_SEARCH_K_DIR, k),
+                );
+                return Ok(id);
+            }
             let (sub, cat) = match filename.as_slice() {
                 b"search" => ("search", crate::magic::CAT_AGENT_SEARCH),
                 b"index" => ("index", crate::magic::CAT_AGENT_INDEX),
@@ -301,15 +372,13 @@ impl NFSFileSystem for AnyHomeFs {
             return Ok(id);
         }
 
-        // Magic dir file lookup (global + agent-scoped).
+        // Magic dir file lookup (global + agent-scoped + search_k).
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
             self.require_agent(&agent_id)?;
-            let scoped = scoped_name(&agent_id, &name);
-            let id = magic_file_id(cat, &scoped);
-            self.magic
-                .register(id, MagicEntry::new(&agent_id, &name, cat));
+            let (id, entry) = self.magic_file_in(dirid, &agent_id, &name, cat);
+            self.magic.register(id, entry);
             return Ok(id);
         }
 
@@ -319,7 +388,20 @@ impl NFSFileSystem for AnyHomeFs {
     async fn getattr(&self, id: fileid3) -> std::result::Result<fattr3, nfsstat3> {
         if is_magic(id) {
             if !is_magic_dir(id) && magic_category(id) == CAT_INDEX {
-                return Ok(self.index_attr(id).await);
+                // Size-oracle closure (init-pro-7): the byte size of an
+                // agent's memory is itself protected data — an unauthenticated
+                // `getattr` on a leaked/guessed fileid used to reveal the real
+                // stored length. Gate it exactly like read/write. The default
+                // agent stays public; directories and real-FS metadata are
+                // not intercepted.
+                if let Some((agent_id, _)) = self.index_name_for(id).await {
+                    self.require_agent(&agent_id)?;
+                    return Ok(self.index_attr(id).await);
+                }
+                // Unresolvable fileid (stale handle / never registered): keep
+                // reporting a zero-sized regular file instead of ACCES, so
+                // restart semantics stay identical to init-pro-6.
+                return Ok(magic_attr_sized(id, 0));
             }
             return Ok(magic_attr(id));
         }
@@ -335,7 +417,15 @@ impl NFSFileSystem for AnyHomeFs {
             if !is_magic_dir(id) {
                 match magic_category(id) {
                     CAT_SEARCH | CAT_WHERE => return Err(nfsstat3::NFS3ERR_ROFS),
-                    CAT_INDEX => return Ok(self.index_attr(id).await),
+                    CAT_INDEX => {
+                        // Same gate as getattr: metadata of an agent's index
+                        // file must not be reachable by unauthenticated callers.
+                        if let Some((agent_id, _)) = self.index_name_for(id).await {
+                            self.require_agent(&agent_id)?;
+                            return Ok(self.index_attr(id).await);
+                        }
+                        return Ok(magic_attr_sized(id, 0));
+                    }
                     _ => {}
                 }
             }
@@ -367,7 +457,7 @@ impl NFSFileSystem for AnyHomeFs {
             };
             self.require_agent(&entry.agent_id)?;
             let content = match cat {
-                CAT_SEARCH => self.run_search(&entry.agent_id, &entry.name).await?,
+                CAT_SEARCH => self.run_search(&entry.agent_id, &entry.name, entry.k).await?,
                 CAT_WHERE => self.run_where(&entry.agent_id, &entry.name).await?,
                 CAT_INDEX => self.index_text(&entry.agent_id, &entry.name).await?,
                 _ => Vec::new(),
@@ -421,10 +511,8 @@ impl NFSFileSystem for AnyHomeFs {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
             self.require_agent(&agent_id)?;
-            let scoped = scoped_name(&agent_id, &name);
-            let id = magic_file_id(cat, &scoped);
-            self.magic
-                .register(id, MagicEntry::new(&agent_id, &name, cat));
+            let (id, entry) = self.magic_file_in(dirid, &agent_id, &name, cat);
+            self.magic.register(id, entry);
             return Ok((id, magic_attr(id)));
         }
         self.real.create(dirid, filename, attr).await
@@ -439,8 +527,7 @@ impl NFSFileSystem for AnyHomeFs {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
             self.require_agent(&agent_id)?;
-            let scoped = scoped_name(&agent_id, &name);
-            let id = magic_file_id(cat, &scoped);
+            let (id, entry) = self.magic_file_in(dirid, &agent_id, &name, cat);
             let exists = match cat {
                 CAT_INDEX => self.db.exists(&agent_id, &name).await.unwrap_or(false),
                 _ => self.magic.get_entry(id).is_some(),
@@ -448,8 +535,7 @@ impl NFSFileSystem for AnyHomeFs {
             if exists {
                 return Err(nfsstat3::NFS3ERR_EXIST);
             }
-            self.magic
-                .register(id, MagicEntry::new(&agent_id, &name, cat));
+            self.magic.register(id, entry);
             return Ok(id);
         }
         self.real.create_exclusive(dirid, filename).await
@@ -475,8 +561,7 @@ impl NFSFileSystem for AnyHomeFs {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
             self.require_agent(&agent_id)?;
-            let scoped = scoped_name(&agent_id, &name);
-            let id = magic_file_id(cat, &scoped);
+            let (id, _) = self.magic_file_in(dirid, &agent_id, &name, cat);
             if cat == CAT_INDEX {
                 let _ = self.db.delete(&agent_id, &name).await;
             }
@@ -585,6 +670,15 @@ impl NFSFileSystem for AnyHomeFs {
             let end = entries.len() <= max_entries;
             entries.truncate(max_entries);
             return Ok(ReadDirResult { entries, end });
+        }
+
+        // /search_k<N> dirs: synthetic variants, deliberately not enumerable
+        // (consistent with the DB layer's non-enumerable query surface).
+        if is_magic(dirid) && magic_category(dirid) == CAT_SEARCH_K_DIR {
+            return Ok(ReadDirResult {
+                entries: Vec::new(),
+                end: true,
+            });
         }
 
         // Magic dirs with files (global + agent-scoped).

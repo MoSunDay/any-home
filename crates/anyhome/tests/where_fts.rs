@@ -1,8 +1,21 @@
 //! `/where` full-text + key-prefix filtering (TODO-09), at the DB layer. Backed
 //! by the FTS5 shadow table kept in sync by triggers; verified to differ from
 //! lexical overlap and to drop a document after deletion.
+//!
+//! init-pro-7 (TODO-43): malformed FTS5 MATCH expressions are reported as a
+//! distinguishable `InvalidFts` outcome (spike-verified: they raise
+//! SqliteFailure at fetch time — the old "bad queries -> no rows" comment was
+//! wrong), so callers can tell "no results" from "query written wrong".
 
-use anyhome::db::{DummyEmbedder, Embedder, MemoryDb};
+use anyhome::db::{DummyEmbedder, Embedder, MemoryDb, WhereOutcome};
+
+/// Unwrap a where_search call into its rows (panics on InvalidFts/Err).
+async fn rows(db: &MemoryDb, agent: &str, cond: &str) -> Vec<(String, String)> {
+    match db.where_search(agent, cond, 10).await.unwrap() {
+        WhereOutcome::Rows(rows) => rows,
+        WhereOutcome::InvalidFts(bad) => panic!("unexpected InvalidFts for {bad:?}"),
+    }
+}
 
 async fn fixture(dim: usize) -> MemoryDb {
     let db = MemoryDb::open(":memory:", dim).await.unwrap();
@@ -21,7 +34,7 @@ async fn fixture(dim: usize) -> MemoryDb {
 #[tokio::test]
 async fn where_matches_a_single_term() {
     let db = fixture(16).await;
-    let res = db.where_search("", "rust", 10).await.unwrap();
+    let res = rows(&db, "", "rust").await;
     assert_eq!(res.len(), 1, "only the rust doc mentions rust");
     assert_eq!(res[0].0, "rust");
 }
@@ -30,7 +43,7 @@ async fn where_matches_a_single_term() {
 async fn where_matches_shared_word_across_docs() {
     let db = fixture(16).await;
     // 'language' occurs in two docs.
-    let res = db.where_search("", "language", 10).await.unwrap();
+    let res = rows(&db, "", "language").await;
     let keys: Vec<&str> = res.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(res.len(), 2, "two docs contain 'language': {keys:?}");
     assert!(keys.contains(&"rust") && keys.contains(&"py"));
@@ -39,19 +52,15 @@ async fn where_matches_shared_word_across_docs() {
 #[tokio::test]
 async fn where_no_longer_hits_after_delete() {
     let db = fixture(16).await;
-    assert_eq!(db.where_search("", "rust", 10).await.unwrap().len(), 1);
+    assert_eq!(rows(&db, "", "rust").await.len(), 1);
     db.delete("", "rust").await.unwrap();
-    assert_eq!(
-        db.where_search("", "rust", 10).await.unwrap().len(),
-        0,
-        "deleted doc is no longer hit"
-    );
+    assert_eq!(rows(&db, "", "rust").await.len(), 0, "deleted doc is no longer hit");
 }
 
 #[tokio::test]
 async fn where_key_prefix_filter_matches_keys() {
     let db = fixture(16).await;
-    let res = db.where_search("", "key:r", 10).await.unwrap();
+    let res = rows(&db, "", "key:r").await;
     assert_eq!(res.len(), 1, "only 'rust' starts with 'r'");
     assert_eq!(res[0].0, "rust");
 }
@@ -59,7 +68,7 @@ async fn where_key_prefix_filter_matches_keys() {
 #[tokio::test]
 async fn where_empty_condition_returns_nothing() {
     let db = fixture(16).await;
-    assert!(db.where_search("", "   ", 10).await.unwrap().is_empty());
+    assert!(rows(&db, "", "   ").await.is_empty());
 }
 
 /// Agent namespace isolation at the FTS layer: `/where` scoped to one agent
@@ -77,14 +86,53 @@ async fn agent_isolation_where_fts() {
     db.upsert("b", "k1", "rust data science", &vb).await.unwrap();
 
     // Agent a's /where must return only agent a's k1.
-    let res_a = db.where_search("a", "rust", 10).await.unwrap();
+    let res_a = rows(&db, "a", "rust").await;
     assert_eq!(res_a.len(), 1, "agent a sees only its own doc: {res_a:?}");
     assert_eq!(res_a[0].0, "k1");
     assert_eq!(res_a[0].1, "rust safety speed");
 
     // Agent b's /where must return only agent b's k1.
-    let res_b = db.where_search("b", "rust", 10).await.unwrap();
+    let res_b = rows(&db, "b", "rust").await;
     assert_eq!(res_b.len(), 1, "agent b sees only its own doc: {res_b:?}");
     assert_eq!(res_b[0].0, "k1");
     assert_eq!(res_b[0].1, "rust data science");
+}
+
+/// init-pro-7 TODO-43: malformed FTS5 expressions must come back as
+/// `InvalidFts` carrying the offending condition — never as a bare DB error
+/// and never silently as "no rows".
+#[tokio::test]
+async fn where_malformed_fts_is_reported_not_swallowed() {
+    let db = fixture(16).await;
+    for bad in ["\"unbalanced", "abc OR", "NEAR(", "a AND", "(x", "*"] {
+        match db.where_search("", bad, 10).await.unwrap() {
+            WhereOutcome::InvalidFts(returned) => assert_eq!(
+                returned, bad,
+                "the offending condition travels back to the caller"
+            ),
+            WhereOutcome::Rows(rows) => panic!("malformed {bad:?} must not look like rows: {rows:?}"),
+        }
+    }
+}
+
+/// A well-formed query with no hits stays `Rows(vec![])` — the error channel
+/// must not fire for legitimate empty results.
+#[tokio::test]
+async fn where_no_hit_is_rows_not_invalid() {
+    let db = fixture(16).await;
+    assert!(rows(&db, "", "zzz_no_such_term").await.is_empty());
+    assert!(matches!(
+        db.where_search("", "zzz_no_such_term", 10).await.unwrap(),
+        WhereOutcome::Rows(_)
+    ));
+}
+
+/// The `key:` prefix filter path keeps returning rows (it has no FTS syntax
+/// surface) — including for prefixes that would be invalid FTS.
+#[tokio::test]
+async fn where_key_prefix_with_fts_metacharacters_still_filters() {
+    let db = fixture(16).await;
+    let res = rows(&db, "", "key:ru").await;
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].0, "rust");
 }

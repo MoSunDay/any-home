@@ -31,14 +31,17 @@ Anything that cannot be enumerated and requires semantic / vector / full-text re
 DB retrieval capabilities are disguised as file-system paths, so agents still only need file operations to query the DB:
 
 - **Vector search**: `cat /search/<query>` — vector KNN search, the path is the query, file content is results (one line per result: `key<TAB>text`).
+- **Controllable result count**: `cat /search_k<N>/<query>` — same as `/search`, but with an explicit KNN top-k (N clamped to 1..=64; `/search` defaults to 16).
 - **Write to index**: `echo "text" > /index/<key>` — writing embeds and upserts into the vector store.
 - **Full-text search**: `cat /where/<word>` — FTS5 full-text MATCH search.
 - **Key prefix filter**: `cat /where/key:<prefix>` — filter by key prefix.
+- **Malformed FTS queries**: `cat /where/<cond>` with invalid FTS5 syntax returns a first line `# error: invalid FTS query: <cond>` (output for valid queries is unchanged).
 
 ### Multi-Agent Namespace Isolation
 
 Each agent gets independent magic-path namespaces:
 - `/agents/<id>/search/<q>` — KNN scoped to agent `<id>`
+- `/agents/<id>/search_k<N>/<q>` — KNN scoped to agent `<id>`, top-k = N
 - `/agents/<id>/index/<key>` — writes belong to agent `<id>`
 - `/agents/<id>/where/<cond>` — FTS/prefix scoped to agent `<id>`
 - First write implicitly creates the agent.
@@ -115,6 +118,9 @@ echo "hello anyhome" > /mnt/anyhome/index/greeting
 cat /mnt/anyhome/search/hello
 # => greeting	hello anyhome
 
+# same, but with an explicit KNN top-k
+cat /mnt/anyhome/search_k4/hello   # same, but only the top-4 results
+
 # FTS5 full-text search
 cat /mnt/anyhome/where/hello
 # => greeting	hello anyhome
@@ -137,8 +143,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # with semantic embeddings
 ### 6. Run tests
 
 ```bash
-cargo test                              # 87 tests (default, zero dependencies)
-cargo test --features embed-fastembed   # 91 tests
+cargo test                              # 102 tests (default, zero dependencies)
+cargo test --features embed-fastembed   # 106 tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -177,15 +183,15 @@ botB:1002
 
 The core pipeline is built and fully tested:
 
-- `cargo test` = **87 tests pass** (default, zero dependencies)
-- `cargo test --features embed-fastembed` = **91 tests pass**
+- `cargo test` = **102 tests pass** (default, zero dependencies)
+- `cargo test --features embed-fastembed` = **106 tests pass**
 - `cargo clippy --all-targets -- -D warnings` = **0 warnings** (both feature combinations)
 
 Feature checklist:
 
 - **Read-only embedded dependencies**: `link_repos/{nfsserve,libsql}` pinned, reproducibly built via `scripts/bootstrap.sh`
 - **NFS backend dispatch**: `AnyHomeFs` routes magic paths to the DB layer, everything else to the filesystem layer (`RealFs`)
-- **Magic paths**: `/search/<q>` (vector KNN), `/index/<key>` (write = embed + upsert), `/where/<word>` (FTS5 MATCH) / `/where/key:<prefix>` (key prefix filter). `/search` and `/where` are read-only query views (write / setattr returns `ROFS`)
+- **Magic paths**: `/search/<q>` (vector KNN), `/search_k<N>/<q>` (same as `/search` with explicit KNN top-k = N, clamped to 1..=64), `/index/<key>` (write = embed + upsert), `/where/<word>` (FTS5 MATCH) / `/where/key:<prefix>` (key prefix filter). `/search`, `/search_k`, and `/where` are read-only query views (write / setattr returns `ROFS`)
 - **Multi-agent namespace isolation**: `/agents/<id>/{search,index,where}`, each with independent DB key space and search scope
 - **Agent identity auth (soft auth)**: optional `--agent-uid` / `--agent-creds`; AUTH_SYS uid binding
 - **Vector search**: libsql native `FLOAT32(dim)` + `libsql_vector_idx`, cosine distance KNN
@@ -195,7 +201,7 @@ Feature checklist:
 ## Known Limitations
 
 - **Write durability (hardened in init-pro-6)**: every `WRITE` RPC upserts to the DB **immediately** (write-through, not buffered until close). A file-backed DB uses `WAL` + `synchronous=FULL`, so each committed write is fsynced and survives a crash. The in-memory write buffer is only for offset composition and is bounded to 256 entries (eviction is safe — the DB is always authoritative).
-- **Soft auth only**: NFSv3 AUTH_SYS `uid`/`gid` is client-asserted and **trivially spoofable** — this mechanism only guards against accidental misuse and cross-contamination, **not adversarial security**. `getattr`/`setattr` (pure metadata) are not authenticated. For strong auth, deploy behind a TLS/mTLS-terminating network front, or upgrade to RPCSEC_GSS/Kerberos.
+- **Soft auth only**: NFSv3 AUTH_SYS `uid`/`gid` is client-asserted and **trivially spoofable** — this mechanism only guards against accidental misuse and cross-contamination, **not adversarial security**. Since init-pro-7, metadata of `/index` files (including the real stored byte size) is gated by agent auth (unauthorized `getattr`/`setattr` returns `ACCES`, closing the "size oracle"); **directories and real-filesystem metadata remain unauthenticated** (friendly to NFS client attribute caching; the sandbox has no mount.nfs, so client-cache interaction under real mounts has not been regression-tested live). For strong auth, deploy behind a TLS/mTLS-terminating network front, or upgrade to RPCSEC_GSS/Kerberos.
 - **root (uid 0) cannot safely use agent auth**: under AUTH_SYS, `uid 0` simultaneously means "anonymous caller" (AUTH_NULL) and "real root" — the two are indistinguishable. Therefore `--agent-uid` / `--agent-creds` **reject** binding `uid 0` — if allowed, all anonymous callers would gain that agent's access. Agent processes must run as a non-root uid.
 
 ## Project Structure
@@ -212,7 +218,7 @@ anyhome/
 │   │   ├── magic.rs        # magic-path encoding, fileid categorization, MagicRegistry
 │   │   ├── backend/        # RealFs: on-disk filesystem layer
 │   │   └── db/             # MemoryDb (libsql), embedder trait and implementations
-│   └── tests/              # integration tests (10 files)
+│   └── tests/              # integration tests (11 files)
 ├── link_repos/             # read-only embedded dependencies (gitignored)
 │   ├── nfsserve/           # user-mode NFSv3 engine (with anyhome fork patch)
 │   └── libsql/             # SQLite fork with native vector retrieval
