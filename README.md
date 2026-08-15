@@ -155,8 +155,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 102 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 106 个测试
+cargo test                              # 109 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 113 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -195,8 +195,8 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **102 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **106 个测试通过**
+- `cargo test` = **109 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **113 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
@@ -219,7 +219,8 @@ botB:1002
 
 - **写入耐久性（init-pro-6 已硬化）**：每次 `WRITE` RPC **立即** upsert 到 DB（write-through，非缓冲至 close）。
   文件型 DB 使用 `WAL` + `synchronous=FULL`，每个已提交写均 fsync、崩溃后存活；内存写缓冲仅用于偏移拼接，
-  且上限 256 条目（超出按任意顺序淘汰，淘汰安全——DB 始终为权威来源）。
+  双重上限：256 条目 + 总计 8 MiB（超出按最久未写优先淘汰；单缓冲自身超限时组合后丢弃，
+  淘汰安全——DB 始终为权威来源，下次写从 DB re-seed；init-pro-8）。
 - **仅 soft auth**：NFSv3 AUTH_SYS 的 `uid`/`gid` 由客户端自报、**极易伪造**——本机制仅防
   误操作与意外串扰，**不构成对抗性安全**。`/index` 文件的元数据（含真实字节大小）自
   init-pro-7 起随 agent 鉴权（未授权 `getattr`/`setattr` 返回 `ACCES`，关闭「大小 oracle」）；
@@ -243,7 +244,7 @@ anyhome/
 │   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
 │   │   ├── backend/        # RealFs：磁盘文件系统层
 │   │   └── db/             # MemoryDb（libsql）、embedder trait 及其实现
-│   └── tests/              # 集成测试（12 个文件）
+│   └── tests/              # 集成测试（13 个文件）
 ├── link_repos/             # 只读内嵌依赖（gitignored）
 │   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
 │   └── libsql/             # 原生支持向量检索的 SQLite 衍生分支

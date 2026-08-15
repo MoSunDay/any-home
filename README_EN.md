@@ -143,8 +143,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # with semantic embeddings
 ### 6. Run tests
 
 ```bash
-cargo test                              # 102 tests (default, zero dependencies)
-cargo test --features embed-fastembed   # 106 tests
+cargo test                              # 109 tests (default, zero dependencies)
+cargo test --features embed-fastembed   # 113 tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -183,8 +183,8 @@ botB:1002
 
 The core pipeline is built and fully tested:
 
-- `cargo test` = **102 tests pass** (default, zero dependencies)
-- `cargo test --features embed-fastembed` = **106 tests pass**
+- `cargo test` = **109 tests pass** (default, zero dependencies)
+- `cargo test --features embed-fastembed` = **113 tests pass**
 - `cargo clippy --all-targets -- -D warnings` = **0 warnings** (both feature combinations)
 
 Feature checklist:
@@ -200,7 +200,7 @@ Feature checklist:
 
 ## Known Limitations
 
-- **Write durability (hardened in init-pro-6)**: every `WRITE` RPC upserts to the DB **immediately** (write-through, not buffered until close). A file-backed DB uses `WAL` + `synchronous=FULL`, so each committed write is fsynced and survives a crash. The in-memory write buffer is only for offset composition and is bounded to 256 entries (eviction is safe — the DB is always authoritative).
+- **Write durability (hardened in init-pro-6)**: every `WRITE` RPC upserts to the DB **immediately** (write-through, not buffered until close). A file-backed DB uses `WAL` + `synchronous=FULL`, so each committed write is fsynced and survives a crash. The in-memory write buffer is only for offset composition and is doubly bounded: 256 entries and 8 MiB total bytes (eviction is least-recently-written first; a single buffer that alone exceeds the cap is dropped after composing — eviction is safe because the DB is always authoritative and the next write re-seeds from it; hardened in init-pro-8).
 - **Soft auth only**: NFSv3 AUTH_SYS `uid`/`gid` is client-asserted and **trivially spoofable** — this mechanism only guards against accidental misuse and cross-contamination, **not adversarial security**. Since init-pro-7, metadata of `/index` files (including the real stored byte size) is gated by agent auth (unauthorized `getattr`/`setattr` returns `ACCES`, closing the "size oracle"); **directories and real-filesystem metadata remain unauthenticated** (friendly to NFS client attribute caching; the sandbox has no mount.nfs, so client-cache interaction under real mounts has not been regression-tested live). For strong auth, deploy behind a TLS/mTLS-terminating network front, or upgrade to RPCSEC_GSS/Kerberos.
 - **root (uid 0) cannot safely use agent auth**: under AUTH_SYS, `uid 0` simultaneously means "anonymous caller" (AUTH_NULL) and "real root" — the two are indistinguishable. Therefore `--agent-uid` / `--agent-creds` **reject** binding `uid 0` — if allowed, all anonymous callers would gain that agent's access. Agent processes must run as a non-root uid.
 
@@ -218,7 +218,7 @@ anyhome/
 │   │   ├── magic.rs        # magic-path encoding, fileid categorization, MagicRegistry
 │   │   ├── backend/        # RealFs: on-disk filesystem layer
 │   │   └── db/             # MemoryDb (libsql), embedder trait and implementations
-│   └── tests/              # integration tests (12 files)
+│   └── tests/              # integration tests (13 files)
 ├── link_repos/             # read-only embedded dependencies (gitignored)
 │   ├── nfsserve/           # user-mode NFSv3 engine (with anyhome fork patch)
 │   └── libsql/             # SQLite fork with native vector retrieval

@@ -26,7 +26,7 @@
 |---|---|---|
 | D1 耐久性策略 | `journal_mode=WAL` + `synchronous=FULL`：并发读不阻塞写，且每个已提交写 fsync（满耐久） | `db/mod.rs::configure_durability` |
 | D2 写穿语义 | 维持「每次 WRITE 即 upsert」（已存在），**不**引入 WAL/replay 机制——没有需要 replay 的缓冲 | `dispatcher.rs::write` → `run_index` → `db.upsert` |
-| D3 缓冲淘汰 | 上限 256 条目，满时淘汰任意一条；DB 为权威来源，淘汰安全（下次写从 DB re-seed） | `magic.rs::MAX_BUFFERS` + `write_into` |
+| D3 缓冲淘汰 | 上限 256 条目，满时淘汰任意一条；DB 为权威来源，淘汰安全（下次写从 DB re-seed）。〔init-pro-8 起演进：LRU + 8 MiB 字节上限，见 `plans/init-pro-8/`〕 | `magic.rs::MAX_BUFFERS` + `write_into` |
 | D4 PRAGMA 通过 query | `journal_mode=WAL` 返回行，libsql `execute` 拒绝返回行的语句 → 用 `query` | `configure_durability` |
 
 ## 状态总表
