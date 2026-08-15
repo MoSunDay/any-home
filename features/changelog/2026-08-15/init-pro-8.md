@@ -13,9 +13,9 @@
 
 ## 变更
 
-1. **TODO-47 dispatcher 拆分（工程门，行为中性）**：`dispatcher.rs` 760 → 455 行，保留
+1. **TODO-47 dispatcher 拆分（工程门，行为中性）**：`dispatcher.rs` 760 → 459 行，保留
    结构体/鉴权辅助/完整 trait impl；新增 `dispatcher/{dbops,routing,readdir}.rs`
-   （135/95/152 行）承载 inherent impl。readdir trait 方法薄委托
+   （140/95/152 行，最终态）承载 inherent impl。readdir trait 方法薄委托
    （`magic_readdir -> Ok(None)` 落回真实 FS）。E0119 红线遵守：trait impl 不跨文件。
 2. **TODO-48 消二次回读**：`run_index` 返回落盘字节数（`text.len()`），`write` 直接构造
    `magic_attr_sized`，不再 `index_attr` 整文回读。WRITE 返回 post-write 属性（NFS

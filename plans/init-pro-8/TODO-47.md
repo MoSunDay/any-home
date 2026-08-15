@@ -3,10 +3,10 @@
 **状态**：done
 
 ## 变更（单独 commit，可二分定位）
-- `crates/anyhome/src/dispatcher.rs`：760 → 453 行。保留：结构体 + `new`/`with_auth`/
+- `crates/anyhome/src/dispatcher.rs`：760 → 455 行（本 commit 时点；TODO-48 后最终 459）。保留：结构体 + `new`/`with_auth`/
   `current_caller`/`require_agent` + 完整 `NFSFileSystem` trait impl；`readdir` trait 方法
   变为薄委托（`magic_readdir` 返回 `Ok(None)` 时落回真实 FS + 根目录魔法目录追加）。
-- `src/dispatcher/dbops.rs`（新，135 行）：`run_search` / `run_index` / `run_where` /
+- `src/dispatcher/dbops.rs`（新，本 commit 时点 135 行，TODO-48 后 140）：`run_search` / `run_index` / `run_where` /
   `index_text` / `index_name_for` / `index_attr`——DB 支撑操作，inherent `impl AnyHomeFs`。
 - `src/dispatcher/routing.rs`（新，95 行）：`dir_category` / `magic_file_in` /
   `agent_id_of_dir` / `magic_parent_of`——纯 registry 解析，无 DB、无 await。

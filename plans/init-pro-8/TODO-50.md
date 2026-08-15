@@ -14,5 +14,5 @@
 
 ## 对账
 - changelog / README / plans 三处测试计数统一为 **109 / 113**（当次 `cargo test` 实跑）。
-- 行数：`dispatcher.rs` 455、`dbops.rs` 135、`routing.rs` 95、`readdir.rs` 152、
+- 行数（最终态）：`dispatcher.rs` 459、`dbops.rs` 140、`routing.rs` 95、`readdir.rs` 152、
   `magic.rs` 490、`db/mod.rs` 663——新文件均 <400、迭代文件均 <800。
