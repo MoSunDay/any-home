@@ -40,7 +40,7 @@
 ## Impact Surface（实际组件面）
 
 - `crates/anyhome/src/dispatcher.rs`（-305 行）+ 新 `dispatcher/{dbops,routing,readdir}.rs`
-- `crates/anyhome/src/magic.rs`（356 → 493 行：`MagicRegistry.buffers` 类型换
+- `crates/anyhome/src/magic.rs`（356 → 490 行：`MagicRegistry.buffers` 类型换
   `BufferTable`，`write_into`/`seed_buffer`/`forget` 内部实现重写，公共 API 签名不变）
 - `crates/anyhome/src/db/mod.rs`（+13 行：计数器字段/自增/读取器，纯观测）
 - `crates/anyhome/tests/write_amplification.rs`（新，2 用例）；

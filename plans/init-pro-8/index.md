@@ -45,5 +45,5 @@ clone/回读 → 写缓冲升级 LRU + 字节上限。
   LRU 单测）；`--features embed-fastembed` = **113 passed**。既有用例（durability /
   magic_write_semantics 等）零回归、断言原样通过。
 - 行数：`dispatcher.rs` 455 / `dbops.rs` 135 / `routing.rs` 95 / `readdir.rs` 152（新文件均
-  <400 门）；`magic.rs` 493 / `db/mod.rs` 658（<800 迭代门）。
+  <400 门）；`magic.rs` 490 / `db/mod.rs` 663（<800 迭代门）。
 - TODO-47 拆分独立 commit，可二分定位。
