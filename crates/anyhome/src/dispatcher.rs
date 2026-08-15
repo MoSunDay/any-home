@@ -301,8 +301,12 @@ impl NFSFileSystem for AnyHomeFs {
                     }
                     let full = self.magic.write_into(id, offset, data);
                     let text = String::from_utf8(full).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
-                    self.run_index(&agent_id, &key, &text).await?;
-                    return Ok(self.index_attr(id).await);
+                    let size = self.run_index(&agent_id, &key, &text).await?;
+                    // Post-write attributes (the NFS WRITE contract): size
+                    // reflects this write's composed content, without an
+                    // extra full-text DB read. getattr/setattr keep using
+                    // `index_attr` (no write happened there, size is unknown).
+                    return Ok(magic_attr_sized(id, size));
                 }
                 CAT_SEARCH | CAT_WHERE => return Err(nfsstat3::NFS3ERR_ROFS),
                 _ => return Ok(magic_attr(id)),

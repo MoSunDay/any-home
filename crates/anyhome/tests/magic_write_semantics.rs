@@ -88,6 +88,27 @@ async fn index_write_composes_with_existing_content() {
     assert_eq!(stored, "line one\nline two");
 }
 
+// ---- TODO-48 (init-pro-8): WRITE returns post-write attributes ----
+
+#[tokio::test]
+async fn write_fattr_reports_this_writes_composed_size() {
+    // The WRITE fattr is sized from the write itself (post-write attributes,
+    // the NFS WRITE contract): no full-text DB read-back is needed, and the
+    // reported size is the content as composed by this write.
+    let fs = make().await;
+    let root = fs.root_dir();
+    let index_dir = fs.lookup(root, &nm(b"index")).await.unwrap();
+    let id = fs.lookup(index_dir, &nm(b"grow")).await.unwrap();
+
+    let attr1 = fs.write(id, 0, b"hello").await.unwrap();
+    assert_eq!(attr1.size, 5, "first WRITE reports its composed size");
+    let attr2 = fs.write(id, 5, b", world").await.unwrap();
+    assert_eq!(attr2.size, 12, "second WRITE reports the composed total");
+
+    // The DB-backed view (getattr) agrees with the last write.
+    assert_eq!(fs.getattr(id).await.unwrap().size, 12);
+}
+
 // ---- TODO-15: exclusive create honors existence ----
 
 #[tokio::test]

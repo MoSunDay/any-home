@@ -110,11 +110,11 @@ async fn every_write_rpc_embeds_full_text_once_and_upserts_write_through() {
 
 #[tokio::test]
 async fn hot_write_path_db_read_shape() {
-    // Read-amplification baseline (pre TODO-48): after upserting, the write
-    // path re-reads the stored text once just to size the fattr
-    // (`index_attr`), and the very first WRITE probes the DB once for a seed
-    // buffer. => m WRITEs cost m + 1 `get_text` calls. TODO-48 removes the
-    // per-WRITE fattr re-read (assertion tightened there to exactly 1).
+    // Read-amplification shape (post init-pro-8 TODO-48): the WRITE fattr is
+    // sized from the write itself (post-write attributes), so the hot path
+    // performs zero `get_text` calls; only the very first WRITE probes the DB
+    // once for a seed buffer. => m WRITEs cost exactly 1 `get_text` (the
+    // pre-TODO-48 baseline was m + 1: one full-text re-read per WRITE).
     let (fs, _emb) = make_fs().await;
     let id = index_handle(&fs, b"big").await;
     let data = payload();
@@ -124,5 +124,5 @@ async fn hot_write_path_db_read_shape() {
             .await
             .unwrap();
     }
-    assert_eq!(fs.db.text_read_count(), (CHUNKS + 1) as u64);
+    assert_eq!(fs.db.text_read_count(), 1);
 }

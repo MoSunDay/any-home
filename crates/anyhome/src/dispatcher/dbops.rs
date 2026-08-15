@@ -38,13 +38,17 @@ impl AnyHomeFs {
         Ok(out.into_bytes())
     }
 
-    /// Embed `text` and upsert it under `(agent_id, key)`.
+    /// Embed `text` and upsert it under `(agent_id, key)`. Returns the
+    /// persisted byte size (`text.len()`) so the WRITE path can size its
+    /// fattr without reading the row back — the upsert just stored exactly
+    /// these bytes (init-pro-8 TODO-48: one fewer full-text DB read per
+    /// WRITE RPC on the hot path).
     pub(super) async fn run_index(
         &self,
         agent_id: &str,
         key: &str,
         text: &str,
-    ) -> std::result::Result<(), nfsstat3> {
+    ) -> std::result::Result<u64, nfsstat3> {
         let emb = self
             .embedder
             .embed(text)
@@ -53,7 +57,8 @@ impl AnyHomeFs {
         self.db
             .upsert(agent_id, key, text, &emb)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)
+            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        Ok(text.len() as u64)
     }
 
     /// Full-text / prefix query for `/where/<cond>` -> `<key>\t<text>\n`
