@@ -231,12 +231,74 @@ impl MagicEntry {
     }
 }
 
-/// Upper bound on resident write buffers. Each `WRITE` RPC upserts to the DB
-/// immediately (the DB is always authoritative), so evicting a buffer is safe:
-/// the next write to that id re-seeds from the DB. This bounds memory for a
-/// long-running server that writes many distinct keys (NFSv3 is stateless and
-/// exposes no `close`/`commit` hook to free buffers eagerly).
+/// Upper bound on resident write buffers (entry count). Each `WRITE` RPC
+/// upserts to the DB immediately (the DB is always authoritative), so
+/// evicting a buffer is safe: the next write to that id re-seeds from the DB.
+/// This bounds memory for a long-running server that writes many distinct
+/// keys (NFSv3 is stateless and exposes no `close`/`commit` hook to free
+/// buffers eagerly).
 const MAX_BUFFERS: usize = 256;
+
+/// Upper bound on total resident write-buffer bytes (init-pro-8 TODO-49).
+/// Eviction is least-recently-written first; a single buffer whose content
+/// alone exceeds the cap is dropped instead of hoarded (the DB stays
+/// authoritative and the next write re-seeds), so resident bytes are
+/// hard-bounded regardless of what a client writes.
+const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// One resident write buffer plus its logical-clock stamp (for LRU eviction).
+#[derive(Default)]
+struct BufferEntry {
+    data: Vec<u8>,
+    last_used: u64,
+}
+
+/// Write buffers together with the logical clock and byte total, all behind
+/// one lock so eviction decisions never observe cross-lock state (the clock
+/// is only ever read/written while holding the buffers lock).
+#[derive(Default)]
+struct BufferTable {
+    map: HashMap<fileid3, BufferEntry>,
+    tick: u64,
+    total_bytes: usize,
+}
+
+impl BufferTable {
+    /// Splice `data` at `offset` into `id`'s buffer (creating it if absent,
+    /// zero-filling any gap), stamp the logical clock, and return a clone of
+    /// the composed bytes. Caps are enforced by the caller afterwards.
+    fn splice(&mut self, id: fileid3, offset: u64, data: &[u8]) -> Vec<u8> {
+        self.tick = self.tick.wrapping_add(1);
+        let e = self.map.entry(id).or_default();
+        e.last_used = self.tick;
+        let old_len = e.data.len();
+        let start = offset as usize;
+        let end = start + data.len();
+        if old_len < end {
+            e.data.resize(end, 0u8);
+        }
+        e.data[start..end].copy_from_slice(data);
+        self.total_bytes += e.data.len() - old_len;
+        e.data.clone()
+    }
+
+    /// Evict least-recently-written entries until both caps hold. The entry
+    /// just spliced carries the newest tick, so it can only be the LRU victim
+    /// when it is the only entry left — in which case it is dropped too
+    /// (hard bound; the splice already returned the composed bytes and the
+    /// DB is authoritative). O(n) per eviction over n <= `MAX_BUFFERS`.
+    fn enforce_caps(&mut self) {
+        while self.map.len() > MAX_BUFFERS || self.total_bytes > MAX_BUFFER_BYTES {
+            let victim = match self.map.iter().min_by_key(|(_, e)| e.last_used) {
+                Some((k, _)) => *k,
+                None => break,
+            };
+            if let Some(e) = self.map.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(e.data.len());
+            }
+        }
+    }
+}
 
 /// Process-local registry mapping synthetic fileids to their decoded context
 /// ([`MagicEntry`]) and write buffers. Populated lazily by `lookup`/`create`
@@ -245,7 +307,7 @@ const MAX_BUFFERS: usize = 256;
 #[derive(Default)]
 pub struct MagicRegistry {
     entries: Mutex<HashMap<fileid3, MagicEntry>>,
-    buffers: Mutex<HashMap<fileid3, Vec<u8>>>,
+    buffers: Mutex<BufferTable>,
 }
 
 impl MagicRegistry {
@@ -264,7 +326,10 @@ impl MagicRegistry {
 
     pub fn forget(&self, id: fileid3) {
         self.entries.lock().unwrap().remove(&id);
-        self.buffers.lock().unwrap().remove(&id);
+        let mut bufs = self.buffers.lock().unwrap();
+        if let Some(e) = bufs.map.remove(&id) {
+            bufs.total_bytes = bufs.total_bytes.saturating_sub(e.data.len());
+        }
     }
 
     /// All `(id, name)` pairs whose category matches `cat` **and** whose
@@ -281,36 +346,34 @@ impl MagicRegistry {
 
     /// Whether an in-flight write buffer already exists for `id`.
     pub fn has_buffer(&self, id: fileid3) -> bool {
-        self.buffers.lock().unwrap().contains_key(&id)
+        self.buffers.lock().unwrap().map.contains_key(&id)
     }
 
     /// Seed the write buffer for `id` from existing persisted content, but only
-    /// if no buffer exists yet.
+    /// if no buffer exists yet. Does not enforce caps by itself: the seed is
+    /// always followed by `write_into` in the same RPC, whose splice composes
+    /// against it before any eviction may drop the (possibly oversized) entry.
     pub fn seed_buffer(&self, id: fileid3, data: Vec<u8>) {
         let mut bufs = self.buffers.lock().unwrap();
-        bufs.entry(id).or_insert(data);
+        if bufs.map.contains_key(&id) {
+            return;
+        }
+        bufs.tick = bufs.tick.wrapping_add(1);
+        let tick = bufs.tick;
+        bufs.total_bytes += data.len();
+        bufs.map.insert(id, BufferEntry { data, last_used: tick });
     }
 
     /// Splice `data` into the write buffer for `id` at `offset`, zero-filling
-    /// any gap, and return a clone of the resulting full buffer.
+    /// any gap, and return a clone of the resulting full buffer. Afterwards
+    /// enforce the entry-count and total-byte caps, evicting least-recently
+    /// written buffers first (safe: the DB is authoritative and a subsequent
+    /// write to an evicted id re-seeds from it).
     pub fn write_into(&self, id: fileid3, offset: u64, data: &[u8]) -> Vec<u8> {
         let mut bufs = self.buffers.lock().unwrap();
-        // Bound memory: if the buffer cache is full and `id` has no buffer yet,
-        // drop one arbitrary entry. Safe because the DB is authoritative and a
-        // subsequent write to the dropped id re-seeds from it.
-        if bufs.len() >= MAX_BUFFERS && !bufs.contains_key(&id) {
-            if let Some(&k) = bufs.keys().next() {
-                bufs.remove(&k);
-            }
-        }
-        let buf = bufs.entry(id).or_default();
-        let start = offset as usize;
-        let end = start + data.len();
-        if buf.len() < end {
-            buf.resize(end, 0u8);
-        }
-        buf[start..end].copy_from_slice(data);
-        buf.clone()
+        let out = bufs.splice(id, offset, data);
+        bufs.enforce_caps();
+        out
     }
 }
 
@@ -327,11 +390,82 @@ mod tests {
         for i in 0..(MAX_BUFFERS + 50) as u64 {
             reg.write_into(magic_file_id(CAT_INDEX, &format!("k{i}")), 0, b"x");
         }
-        let n = reg.buffers.lock().unwrap().len();
+        let n = reg.buffers.lock().unwrap().map.len();
         assert!(
             n <= MAX_BUFFERS,
             "buffer cache must stay <= {MAX_BUFFERS}, got {n}"
         );
+    }
+
+    #[test]
+    fn lru_keeps_hot_keys_resident() {
+        // 301 distinct ids against a 256-entry cap => 45 evictions, and all
+        // 45 victims are strictly older than the mid-churn refresh of `hot`:
+        // eviction is least-recently-written first, so `hot` survives while
+        // the never-refreshed `old*` keys do not.
+        let reg = MagicRegistry::default();
+        let hot = magic_file_id(CAT_INDEX, "hot");
+        reg.write_into(hot, 0, b"h");
+        for i in 0..100u64 {
+            reg.write_into(magic_file_id(CAT_INDEX, &format!("old{i}")), 0, b"o");
+        }
+        reg.write_into(hot, 0, b"h"); // refresh recency
+        for i in 0..200u64 {
+            reg.write_into(magic_file_id(CAT_INDEX, &format!("new{i}")), 0, b"n");
+        }
+        assert!(reg.has_buffer(hot), "recently re-written key must survive");
+        assert!(
+            !reg.has_buffer(magic_file_id(CAT_INDEX, "old0")),
+            "strictly older key must be evicted"
+        );
+        let n = reg.buffers.lock().unwrap().map.len();
+        assert!(n <= MAX_BUFFERS, "entry cap holds, got {n}");
+    }
+
+    #[test]
+    fn byte_cap_evicts_lru_first() {
+        // 3 x 3 MiB buffers: the third pushes the total to 9 MiB > 8 MiB, so
+        // the least recently written one is evicted (not an arbitrary one).
+        let reg = MagicRegistry::default();
+        let big = vec![0u8; 3 * 1024 * 1024];
+        let a = magic_file_id(CAT_INDEX, "a");
+        let b = magic_file_id(CAT_INDEX, "b");
+        let c = magic_file_id(CAT_INDEX, "c");
+        reg.write_into(a, 0, &big);
+        reg.write_into(b, 0, &big);
+        assert!(reg.has_buffer(a) && reg.has_buffer(b), "6 MiB fits the cap");
+        reg.write_into(c, 0, &big);
+        assert!(!reg.has_buffer(a), "LRU victim evicted on byte cap");
+        assert!(reg.has_buffer(b) && reg.has_buffer(c), "recent buffers stay");
+    }
+
+    #[test]
+    fn single_oversize_buffer_is_dropped_not_hoarded() {
+        // A single buffer whose content alone exceeds the byte cap is dropped
+        // after composing (hard bound), but the composed bytes are still
+        // returned for validation/embed/upsert — the write itself is unaffected.
+        let reg = MagicRegistry::default();
+        let id = magic_file_id(CAT_INDEX, "huge");
+        let huge = vec![b'x'; MAX_BUFFER_BYTES + 1];
+        let out = reg.write_into(id, 0, &huge);
+        assert_eq!(out.len(), MAX_BUFFER_BYTES + 1);
+        assert!(!reg.has_buffer(id), "oversize buffer must not stay resident");
+    }
+
+    #[test]
+    fn oversize_seed_composes_before_drop() {
+        // Seeding a >cap row and then appending must still compose the full
+        // content (seed + new bytes) before the cap drops the buffer; the next
+        // write would re-seed from the DB transparently.
+        let reg = MagicRegistry::default();
+        let id = magic_file_id(CAT_INDEX, "big");
+        let seed_len = MAX_BUFFER_BYTES + 1024;
+        reg.seed_buffer(id, vec![b'a'; seed_len]);
+        let out = reg.write_into(id, seed_len as u64, b"tail");
+        assert_eq!(out.len(), seed_len + 4);
+        assert_eq!(&out[..8], b"aaaaaaaa");
+        assert_eq!(&out[seed_len..], b"tail");
+        assert!(!reg.has_buffer(id));
     }
 
     #[test]
