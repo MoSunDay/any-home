@@ -23,6 +23,8 @@ pub mod fastembed;
 
 use anyhow::{anyhow, Context, Result};
 use libsql::{params, Builder, Connection, Row};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub use embedder::{dummy_embed, DummyEmbedder, Embedder, DUMMY_DIM};
 
@@ -34,6 +36,10 @@ const SCHEMA_VERSION: i64 = 1;
 pub struct MemoryDb {
     conn: Connection,
     dim: usize,
+    /// `get_text` call counter (write-path read-amplification spike,
+    /// init-pro-8 TODO-46). Shared across clones so the count always reflects
+    /// the one underlying connection. Purely observational: no behavior change.
+    text_reads: Arc<AtomicU64>,
 }
 
 impl MemoryDb {
@@ -47,7 +53,7 @@ impl MemoryDb {
     pub async fn open(path: &str, dim: usize) -> Result<Self> {
         let db = Builder::new_local(path).build().await.context("open libsql database")?;
         let conn = db.connect().context("connect libsql database")?;
-        let store = MemoryDb { conn, dim };
+        let store = MemoryDb { conn, dim, text_reads: Arc::new(AtomicU64::new(0)) };
         store.configure_durability().await?;
         store.init_schema().await?;
         store.migrate_schema().await?;
@@ -109,6 +115,12 @@ impl MemoryDb {
     /// Dimensionality of the embedding column.
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// How many `get_text` calls have been served so far (spike
+    /// instrumentation, see the field docs). Shared across clones.
+    pub fn text_read_count(&self) -> u64 {
+        self.text_reads.load(Ordering::Relaxed)
     }
 
     async fn init_schema(&self) -> Result<()> {
@@ -455,6 +467,7 @@ impl MemoryDb {
 
     /// The stored text for `(agent_id, key)`, if present.
     pub async fn get_text(&self, agent_id: &str, key: &str) -> Result<Option<String>> {
+        self.text_reads.fetch_add(1, Ordering::Relaxed);
         let mut rows = self
             .conn
             .query(
