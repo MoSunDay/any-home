@@ -138,3 +138,100 @@ impl AnyHomeFs {
         magic_attr_sized(id, size)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Direct unit tests for the DB-backed magic-path operations
+    //! (init-pro-9 TODO-51): `run_index` / `run_search` / `run_where`.
+
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+
+    use crate::backend::RealFs;
+    use crate::db::{DummyEmbedder, Embedder, MemoryDb};
+
+    use super::*;
+
+    async fn make() -> AnyHomeFs {
+        let root = tempdir().expect("tempdir").keep();
+        let real = RealFs::new(root).unwrap();
+        let db = MemoryDb::open(":memory:", 16).await.unwrap();
+        let emb: Arc<dyn Embedder> = Arc::new(DummyEmbedder::new(16));
+        AnyHomeFs::new(real, db, emb)
+    }
+
+    #[tokio::test]
+    async fn run_index_writes_through_and_returns_byte_size() {
+        let fs = make().await;
+        let size = fs.run_index("", "k1", "hello world").await.unwrap();
+        assert_eq!(size, "hello world".len() as u64);
+        assert_eq!(
+            fs.db.get_text("", "k1").await.unwrap().as_deref(),
+            Some("hello world"),
+            "run_index must upsert write-through"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_search_ranks_exact_match_first() {
+        let fs = make().await;
+        fs.run_index("", "k1", "hello world").await.unwrap();
+        fs.run_index("", "k2", "totally unrelated words")
+            .await
+            .unwrap();
+
+        let out = fs.run_search("", "hello world", 16).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let first = text.lines().next().expect("at least one result");
+        assert_eq!(first, "k1\thello world", "exact match ranks top-1");
+    }
+
+    #[tokio::test]
+    async fn run_search_is_agent_scoped() {
+        let fs = make().await;
+        fs.run_index("alpha", "k", "shared text").await.unwrap();
+
+        let out = fs.run_search("", "shared text", 16).await.unwrap();
+        assert!(out.is_empty(), "default agent must not see alpha's rows");
+
+        let out = fs.run_search("alpha", "shared text", 16).await.unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "k\tshared text\n");
+    }
+
+    #[tokio::test]
+    async fn run_where_matches_fts_and_key_prefix() {
+        let fs = make().await;
+        fs.run_index("", "notes/a", "alpha beta gamma")
+            .await
+            .unwrap();
+        fs.run_index("", "other", "delta epsilon").await.unwrap();
+
+        let out = fs.run_where("", "beta").await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "notes/a\talpha beta gamma\n"
+        );
+
+        let out = fs.run_where("", "key:notes/").await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "notes/a\talpha beta gamma\n"
+        );
+
+        let out = fs.run_where("", "zebra").await.unwrap();
+        assert!(out.is_empty(), "no-hit where returns empty rows");
+    }
+
+    #[tokio::test]
+    async fn run_where_renders_malformed_fts_as_error_line() {
+        let fs = make().await;
+        fs.run_index("", "k", "some text").await.unwrap();
+        let out = fs.run_where("", "\"unclosed").await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("# error: invalid FTS query: "),
+            "malformed FTS must render an error marker, got: {text:?}"
+        );
+    }
+}

@@ -150,3 +150,57 @@ impl AnyHomeFs {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Minimal behavior pinning for `magic_readdir` (init-pro-9 TODO-51):
+    //! non-magic dirids must return `Ok(None)` so the dispatcher delegates
+    //! to the real filesystem; `/search_k<N>` is handled but not enumerable.
+
+    use std::sync::Arc;
+
+    use nfsserve::vfs::NFSFileSystem;
+    use tempfile::tempdir;
+
+    use crate::backend::{RealFs, ROOT_ID};
+    use crate::db::{DummyEmbedder, Embedder, MemoryDb};
+    use crate::magic::search_k_dir_id;
+
+    use super::*;
+
+    async fn make() -> AnyHomeFs {
+        let root = tempdir().expect("tempdir").keep();
+        let real = RealFs::new(root).unwrap();
+        let db = MemoryDb::open(":memory:", 16).await.unwrap();
+        let emb: Arc<dyn Embedder> = Arc::new(DummyEmbedder::new(16));
+        AnyHomeFs::new(real, db, emb)
+    }
+
+    #[tokio::test]
+    async fn non_magic_dirs_fall_through_to_real_fs() {
+        let fs = make().await;
+
+        // Root itself is not in the magic namespace...
+        assert!(fs.magic_readdir(ROOT_ID, 0, 16).await.unwrap().is_none());
+
+        // ...nor is a real subdirectory.
+        let (dir_id, _) = fs
+            .real
+            .mkdir(ROOT_ID, &b"sub"[..].into())
+            .await
+            .unwrap();
+        assert!(fs.magic_readdir(dir_id, 0, 16).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn search_k_dirs_are_handled_but_not_enumerable() {
+        let fs = make().await;
+        let res = fs
+            .magic_readdir(search_k_dir_id("", 8), 0, 16)
+            .await
+            .unwrap()
+            .expect("search_k dir is a magic dir, must be handled");
+        assert!(res.entries.is_empty(), "deliberately not enumerable");
+        assert!(res.end);
+    }
+}
