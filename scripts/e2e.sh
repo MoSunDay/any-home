@@ -9,8 +9,10 @@
 # that are expected to have a working NFS client.
 #
 # Embedder backend is chosen via ANYHOME_EMBEDDER (default: dummy). With
-# fastembed the build enables the embed-fastembed feature and, if the model
-# cache is present, the server runs fully offline against it.
+# fastembed the build enables the embed-fastembed feature and the server runs
+# fully offline against a prefetched model cache (HF_HOME + HF_HUB_OFFLINE=1);
+# a missing cache fails fast BEFORE build/start — an e2e run must never hang
+# on a network fetch (see scripts/fetch-model.sh for the prefetch).
 #
 # Usage: scripts/e2e.sh [--require-mount] [PORT]
 set -euo pipefail
@@ -62,8 +64,11 @@ WORK="$(mktemp -d -t anyhome-e2e-XXXXXX)"
 MOUNT_OPTS="vers=3,tcp,nolock,noacl,port=${PORT},mountport=${PORT}"
 
 # HF cache for the fastembed ONNX model (Qdrant's mirror of all-MiniLM-L6-v2).
-# Only consulted when EMBEDDER=fastembed; reused offline to avoid any download.
-HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--Qdrant--all-MiniLM-L6-v2-onnx"
+# Only consulted when EMBEDDER=fastembed. fetch-model.sh's convention: HF_HOME
+# points AT the hub dir (fastembed uses it verbatim, no /hub appended), so the
+# model dir lives directly under it. A missing cache is a hard failure BEFORE
+# build/start — an e2e run must never attempt a network fetch (it can hang).
+HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface/hub}/models--Qdrant--all-MiniLM-L6-v2-onnx"
 
 cleanup() {
     if mountpoint -q "$MNT2" 2>/dev/null; then umount -f "$MNT2" 2>/dev/null || true; fi
@@ -73,6 +78,15 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+
+# ---- fastembed fail-fast guard ----------------------------------------------
+# fastembed/hf-hub has no timeout, so a download attempt can hang an e2e run
+# forever. Require the prefetched cache up front; with it the server below runs
+# with HF_HUB_OFFLINE=1 and never touches the network.
+if [ "$EMBEDDER" = "fastembed" ] && [ ! -d "$HF_CACHE_DIR" ]; then
+    echo "FAIL: fastembed requested but no model cache at $HF_CACHE_DIR — prefetch with scripts/fetch-model.sh or run with ANYHOME_EMBEDDER=dummy"
+    exit 1
+fi
 
 # ---- build ------------------------------------------------------------------
 if [ "$EMBEDDER" = "fastembed" ]; then
@@ -89,13 +103,14 @@ BIN="$TARGET_DIR/debug/anyhome"
 echo "==> starting anyhome on ${HOST}:${PORT} (fs=$WORK/fs db=$WORK/mem.db embedder=${EMBEDDER})"
 mkdir -p "$WORK/fs"
 
-# When using fastembed, reuse a prefetched model cache offline so the server
-# never needs network. Only set HF_HOME/HF_HUB_OFFLINE when the cache actually
-# exists; without it fastembed will try to download (and fail offline).
+# When using fastembed, run fully offline against the prefetched cache. Its
+# presence was asserted by the fail-fast guard above (before the build), so we
+# can unconditionally pin HF_HOME + HF_HUB_OFFLINE=1; anyhome's
+# FastEmbedder::new honors the flag itself (hf-hub ignores it).
 SERVER_ENV=()
-if [ "$EMBEDDER" = "fastembed" ] && [ -d "$HF_CACHE_DIR" ]; then
+if [ "$EMBEDDER" = "fastembed" ]; then
     echo "    -> using cached ONNX model at $HF_CACHE_DIR (HF_HUB_OFFLINE=1)"
-    SERVER_ENV+=(env "HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}" HF_HUB_OFFLINE=1)
+    SERVER_ENV+=(env "HF_HOME=${HF_HOME:-$HOME/.cache/huggingface/hub}" HF_HUB_OFFLINE=1)
 fi
 
 "${SERVER_ENV[@]}" "$BIN" --fs-root "$WORK/fs" --db-path "$WORK/mem.db" \

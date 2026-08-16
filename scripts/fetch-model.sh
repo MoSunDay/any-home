@@ -57,7 +57,9 @@ for f in "${FILES[@]}"; do
 done
 
 # Record the resolved commit so hf-hub treats this snapshot as current.
-echo "$SHA" > "$MODEL_DIR/refs/main"
+# hf-hub reads refs/main UNTRIMMED, so no trailing newline here (printf, not
+# echo): a newline would make the prefetched cache invisible to fastembed.
+printf '%s' "$SHA" > "$MODEL_DIR/refs/main"
 
 echo "==> done. Use offline with:"
 echo "    export HF_HOME=$HOME/.cache/huggingface/hub"
