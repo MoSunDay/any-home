@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
@@ -42,6 +42,9 @@ async fn main() -> Result<()> {
 
     let real = RealFs::new(cli.fs_root.clone())?;
     let db = MemoryDb::open(&cli.db_path, dim).await?;
+    // Clone for the graceful-shutdown checkpoint below; `db` itself moves into
+    // AnyHomeFs (MemoryDb is cheaply Clone — shares the one connection).
+    let db_shutdown = db.clone();
 
     // Assemble the agent authorization policy from `--agent-uid` flags and an
     // optional `--agent-creds` file. With no credentials at all the policy
@@ -62,7 +65,35 @@ async fn main() -> Result<()> {
         p = port_of(&cli.addr),
         e = if cli.export == "/" { "/".to_string() } else { cli.export.clone() },
     );
-    listener.handle_forever().await?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("install SIGINT handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+
+    let served = tokio::select! {
+        res = listener.handle_forever() => Some(res),
+        _ = sigint.recv() => { tracing::info!("SIGINT received: starting graceful shutdown"); None }
+        _ = sigterm.recv() => { tracing::info!("SIGTERM received: starting graceful shutdown"); None }
+    };
+    if let Some(res) = served {
+        res.context("nfs listener")?;
+    }
+
+    // Converge the WAL into the main DB file so a plain copy of `--db-path` is a
+    // complete backup. Committed writes are already fsynced (synchronous=FULL), so
+    // a checkpoint failure loses nothing — it only leaves data in the WAL.
+    match db_shutdown.checkpoint().await {
+        Ok((0, wal_frames, checkpointed)) => {
+            tracing::info!(wal_frames, checkpointed, "WAL checkpoint complete (TRUNCATE)");
+        }
+        Ok((busy, wal_frames, checkpointed)) => {
+            tracing::warn!(busy, wal_frames, checkpointed,
+                "WAL checkpoint blocked by a concurrent reader (PASSIVE fallback); WAL retains frames");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "WAL checkpoint failed; committed data remains safe in the WAL");
+        }
+    }
     Ok(())
 }
 

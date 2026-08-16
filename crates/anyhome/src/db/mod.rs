@@ -1,10 +1,10 @@
 //! Vector-backed memory store built on embedded libSQL (core-only).
 //!
-//! Each memory is an `(agent_id, key, text, embedding)` row. Search is KNN over
-//! the vector index; `/where` is full-text over an FTS5 shadow table kept in
-//! sync by triggers. A single [`libsql::Connection`] is shared (it is `Clone`
-//! and backed by an `Arc`, with SQLite compiled in SERIALIZED mode), so no
-//! `Mutex` is needed.
+//! Each memory is an `(agent_id, key, text, embedding)` row. Search is a
+//! scoped brute-force cosine KNN over the agent's partition (init-pro-12);
+//! `/where` is full-text over an FTS5 shadow table kept in sync by triggers.
+//! A single [`libsql::Connection`] is shared (it is `Clone` and backed by an
+//! `Arc`, with SQLite compiled in SERIALIZED mode), so no `Mutex` is needed.
 //!
 //! Multi-agent namespace isolation (TODO-21..25): every row carries an
 //! `agent_id` that scopes all queries. The global magic paths (`/search`,
@@ -117,6 +117,33 @@ impl MemoryDb {
             .get(0)
             .context("synchronous value")?;
         Ok((mode, sync))
+    }
+
+    /// Fold the WAL back into the main database file (TRUNCATE mode: after a
+    /// successful checkpoint the `-wal` file is truncated to zero bytes, so a
+    /// plain copy of the main file is a consistent backup). Returns
+    /// `(busy, wal_frames, checkpointed_frames)`: `busy != 0` means a concurrent
+    /// reader blocked the truncate and the WAL still holds frames (degraded to
+    /// PASSIVE semantics) — callers must log this, never swallow it. A `:memory:`
+    /// DB has no WAL; the pragma is a harmless no-op there (it returns a single
+    /// `(0, -1, -1)` row) and must not error. Committed data is fsynced already
+    /// (synchronous=FULL), so a failed checkpoint never loses data — it only
+    /// leaves it in the WAL.
+    pub async fn checkpoint(&self) -> Result<(i64, i64, i64)> {
+        let mut rows = self
+            .conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .context("wal checkpoint")?;
+        let row = rows
+            .next()
+            .await
+            .context("fetch wal_checkpoint row")?
+            .context("wal_checkpoint row missing")?;
+        let busy: i64 = row.get(0).context("wal checkpoint busy")?;
+        let wal_frames: i64 = row.get(1).context("wal checkpoint wal frames")?;
+        let checkpointed: i64 = row.get(2).context("wal checkpoint frames moved")?;
+        Ok((busy, wal_frames, checkpointed))
     }
 
     /// Dimensionality of the embedding column.
