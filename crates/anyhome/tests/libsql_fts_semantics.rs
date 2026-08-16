@@ -131,7 +131,7 @@ async fn cleared_shadow_tables_are_recovered_by_rebuild() {
         .query("SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?", params!["alpha"])
         .await
         .expect("prepare succeeds; corruption surfaces on fetch");
-    let err = corrupt.next().await.err().expect("cleared shadow tables must break MATCH");
+    let err = corrupt.next().await.expect_err("cleared shadow tables must break MATCH");
     let msg = err.to_string();
     assert!(msg.contains("malformed"), "expected corruption message, got: {msg}");
 
@@ -212,7 +212,11 @@ async fn blank_condition_is_empty_rows_not_invalid() {
 #[tokio::test]
 async fn large_text_roundtrip_stays_searchable() {
     let db = mem_db().await;
-    let text: String = (0..1000).map(|i| format!("tok{i} ")).collect();
+    let mut text = String::new();
+    for i in 0..1000 {
+        use std::fmt::Write as _;
+        write!(text, "tok{i} ").unwrap(); // String write cannot fail
+    }
     db.upsert("", "big", &text, &dummy_embed(&text, DIM)).await.unwrap();
     assert_eq!(keys(&rows(&db, "", "tok999").await), ["big"]);
     assert_eq!(keys(&rows(&db, "", "tok0 AND tok999").await), ["big"]);
