@@ -11,7 +11,7 @@
 - `src/dispatcher/dbops.rs` +97（140→237）：5 用例——`run_index` 写穿且返回字节
   尺寸、`run_search` 精确匹配 top-1、`run_search` agent 隔离、`run_where` FTS/
   `key:` 前缀/无命中空结果、`run_where` 畸形 FTS 渲染 `# error:` 行。
-- `src/dispatcher/readdir.rs` +55（152→207）：2 用例——非魔法目录（根 + 真实
+- `src/dispatcher/readdir.rs` +54（152→206）：2 用例——非魔法目录（根 + 真实
   子目录）fallthrough `Ok(None)`、search_k 目录被处理但不可枚举。
 - 惯例：`:memory:` DB（dim 16）+ `DummyEmbedder` + `tempdir().keep()`，与集成
   测试 `make()` 一致；测试位于子模块内，天然可达 `pub(super)` 方法与私有字段。

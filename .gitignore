@@ -44,3 +44,8 @@ __pycache__/
 .opencode
 .opencoder
 logs
+
+# Deployment artifacts (anyhome server runtime state, see README)
+/anyhome-fs/
+/anyhome.db*
+/anyhome-server.log
