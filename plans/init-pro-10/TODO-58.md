@@ -1,6 +1,6 @@
 # TODO-58 · libsql 向量语义移植（12 例）
 
-**状态**：done（commit 2bd9483）
+**状态**：done（commit 2bd9483；评审后断言校准见 changelog 变更 7）
 
 ## 范围决策
 `libsql_vector.test`/`libsql_vector_index.test` 中**单连接纯 SQL** 的 KNN 场景可
@@ -9,7 +9,7 @@
 （integration_tests.rs）整体移植，rand → 内联 xorshift32（seed 0x5EED_BA5E）。
 
 ## 变更
-`tests/libsql_vector_semantics.rs`（332 行，12 例）：backfill 序（按 k 钉余弦
+`tests/libsql_vector_semantics.rs`（342 行，12 例）：backfill 序（按 k 钉余弦
 top-k 选择 + key 序输出）、upsert 覆盖翻转排名 + 旧向量消失、delete 从 KNN 消失、
 空表 search、等距 tie-break 同构建确定性、k>行数全返、维度不匹配 Err 含
 `dimensions are different`、agent 过滤后置 <k 行、文件 DB reopen 不变、fuzz 200
@@ -19,3 +19,7 @@ top-k 选择 + key 序输出）、upsert 覆盖翻转排名 + 旧向量消失、
 1. `search(.., 0)` → 捆绑 libSQL 向量索引堆损坏 SIGABRT（子进程钉死）。
 2. 输出按 key 序（JOIN 被 `sqlite_autoindex_memories_1` 驱动，EXPLAIN 实证）。
 3. agent 过滤在全局 top-k 之后（单 agent 可能 <k/0 行）。
+4. fuzz 非空命中不作门禁：固定 seed 序列 step 172 间歇性空结果（8 跑 6 败，
+   正确性断言从未触发），捆绑 libSQL 读路径非确定性（与 k=0 堆损坏同源）——
+   注释记录为已知上游缺陷；alive-set 子集不变量（返回键 ⊆ alive、已删键不
+   复现）仍是硬门禁。

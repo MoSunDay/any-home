@@ -13,3 +13,6 @@
 - `cargo test --workspace`：149 passed / 0 failed / 0 ignored。
 - `cargo test --features embed-fastembed`：153 passed。
 - 新增 26 = identity 2 + vector 12 + fts 12；文件数 13 → 16。
+- 评审后复跑（TODO-58 fuzz 断言校准后）：`--test libsql_vector_semantics`
+  22 连绿、`--workspace` 3 连绿（149）、`embed-fastembed` 全绿（153），
+  计数与上表一致；vector 文件行数 332 → 342（注释增量）。

@@ -53,6 +53,12 @@ embed-fastembed` 127 passed。
    （`echo > /index/k && cat /search/k` 往返成功）后保持运行。
 6. **TODO-61 文档三件套 + 计数对账**：本文件 + `plans/init-pro-10/`（index +
    TODO-56..61）+ README 双语计数 123/127 → 149/153、结构行 13 → 16 文件。
+7. **评审后修正（TODO-58 fuzz 断言校准，src/ 仍零改动）**：fuzz 例原「alive
+   非空则命中必非空」断言超出捆绑 libSQL 实际保证——固定 seed 确定性序列在
+   step 172 间歇性返回空结果（同构建 8 跑 6 败，其余正确性断言从未触发），
+   指向向量索引读路径非确定性（与 k=0 堆损坏同源 UB）。按评审 gap 处置：保留
+   alive-set 正确性门禁（返回键 ⊆ alive、已删键永不复现），非空期望降级为注释
+   记录的已知上游缺陷。
 
 ## 关键决策（不做什么 / 为什么）
 
@@ -64,6 +70,9 @@ embed-fastembed` 127 passed。
   column Err、rebuild 不自动触发）一律**按现状钉死并注释**；写路径与公共签名
   红线零触碰，magic-path 行为零变化。k=0 abort 属上游 libSQL 缺陷，用子进程探针
   记录而非在 anyhome 侧拦截（拦截会改变 `search` 签名语义，留待上游修复）。
+- **fuzz 非空期望不作门禁**：捆绑 libSQL 读路径在确定性序列上非确定
+  （step 172 间歇性空、8 跑 6 败；与 k=0 堆损坏同源），超出上游文档保证；
+  按已知上游缺陷注释在案，正确性门禁只保留 alive-set 子集不变量。
 - **部署用 dummy embedder**：本机无 HF 模型缓存，保证离线可复现；e2e 用独立端口
   21111 避免与常驻实例 11111 冲突。
 - **fuzz 不引 rand**：内联 xorshift32 + 固定 seed `0x5EED_BA5E`，与仓库"零网络
@@ -72,7 +81,7 @@ embed-fastembed` 127 passed。
 ## Impact Surface
 
 - 新增 `crates/anyhome/tests/{nfsserve_identity,libsql_vector_semantics,
-  libsql_fts_semantics}.rs`（34/332/250 行，均 <400）；`.gitignore` 追加 3 行；
+  libsql_fts_semantics}.rs`（34/342/250 行，均 <400）；`.gitignore` 追加 3 行；
   `plans/init-pro-9/TODO-51.md` 单行修正。
 - src/ 零改动：既有 123 用例原样通过，行为零变化。
 
@@ -81,6 +90,10 @@ embed-fastembed` 127 passed。
 - `cargo test --workspace` = **149 passed / 0 failed / 0 ignored**（123 基线 +
   26 新增：identity 2 + vector 12 + fts 12）；`--features embed-fastembed` =
   **153 passed**。零回归。
+- **评审复跑修正记录**：评审当次实跑抓到 fuzz 例间歇性失败（step 172，8 跑
+  6 败）；按上述第 7 项完成断言校准后复跑 `--test libsql_vector_semantics`
+  连续 22 次全绿（12/12）+ `--workspace` 连续 3 次全绿（149/0/0）、
+  `--features embed-fastembed` 全绿（153/0），计数与本节一致。
 - `cargo clippy --workspace --all-targets -- -D warnings` 双 feature 零警告。
 - `scripts/e2e.sh --require-mount 21111` exit 0：`PASS: index/search/where +
   where-prefix + agent-where + persistence + auth live all green over NFSv3`
