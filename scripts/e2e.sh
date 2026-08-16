@@ -125,6 +125,14 @@ echo "==> mounting ${HOST}:${EXPORT} at $MNT"
 mkdir -p "$MNT"
 mount.nfs -o "$MOUNT_OPTS" "${HOST}:${EXPORT}" "$MNT"
 
+# ---- MOUNT export-name enforcement (negative case) --------------------------
+echo "==> asserting MOUNT enforces the export name (wrong export must be refused)"
+mkdir -p "$WORK/mnt-bad"
+if mount.nfs -o "$MOUNT_OPTS" "${HOST}:/definitely-not-the-export" "$WORK/mnt-bad" 2>/dev/null; then
+    echo "FAIL: server accepted a mount for a wrong export name"; exit 1
+fi
+echo "    -> wrong export refused as expected"
+
 # ---- /index -> /search round-trip -------------------------------------------
 echo "==> /index/greeting <- 'hello anyhome'"
 echo "hello anyhome" > "$MNT/index/greeting"
@@ -136,7 +144,7 @@ echo "==> cat $QUERY"
 cat "$QUERY"
 
 echo "==> asserting top-1 is 'greeting<TAB>hello anyhome'"
-if ! grep -q "^greeting	hello anyhome$" "$QUERY"; then
+if ! grep -q "^greeting${T}hello anyhome$" "$QUERY"; then
     echo "FAIL: expected 'greeting<TAB>hello anyhome' in /search results"; exit 1
 fi
 
@@ -151,10 +159,10 @@ echo "==> cat $WHERE_QUERY"
 cat "$WHERE_QUERY"
 
 echo "==> asserting /where/hello mentions both keys (greeting, second)"
-if ! grep -q "^greeting	" "$WHERE_QUERY"; then
+if ! grep -q "^greeting${T}" "$WHERE_QUERY"; then
     echo "FAIL: expected key 'greeting' in /where results"; exit 1
 fi
-if ! grep -q "^second	" "$WHERE_QUERY"; then
+if ! grep -q "^second${T}" "$WHERE_QUERY"; then
     echo "FAIL: expected key 'second' in /where results"; exit 1
 fi
 
@@ -198,7 +206,7 @@ A_QUERY="$MNT/agents/botA/search/agent%20memory"
 echo "==> cat $A_QUERY"
 cat "$A_QUERY"
 echo "==> asserting agent A search returns 'agent A memory'"
-if ! grep -q "^greeting	agent A memory$" "$A_QUERY"; then
+if ! grep -q "^greeting${T}agent A memory$" "$A_QUERY"; then
     echo "FAIL: expected 'greeting<TAB>agent A memory' in agent A search"; exit 1
 fi
 
@@ -207,7 +215,7 @@ B_QUERY="$MNT/agents/botB/search/agent%20memory"
 echo "==> cat $B_QUERY"
 cat "$B_QUERY"
 echo "==> asserting agent B search returns 'agent B memory'"
-if ! grep -q "^greeting	agent B memory$" "$B_QUERY"; then
+if ! grep -q "^greeting${T}agent B memory$" "$B_QUERY"; then
     echo "FAIL: expected 'greeting<TAB>agent B memory' in agent B search"; exit 1
 fi
 
@@ -291,4 +299,4 @@ if ls "$MNT2/agents/" 2>/dev/null | grep -q "botA"; then
     echo "FAIL: /agents/ listing leaked botA to unauthorized caller"; exit 1
 fi
 
-echo "PASS: index/search/where + where-prefix + agent-where + persistence + auth live all green over NFSv3"
+echo "PASS: index/search/where + where-prefix + agent-where + persistence + auth + export-name enforcement live all green over NFSv3"

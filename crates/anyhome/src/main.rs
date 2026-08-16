@@ -8,7 +8,7 @@ use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
 use anyhome::cli::{port_of, EmbedderKind};
 use anyhome::db::{DummyEmbedder, Embedder};
-use anyhome::{AnyHomeFs, AuthPolicy, Cli, MemoryDb, RealFs};
+use anyhome::{AnyHomeFs, Cli, MemoryDb, RealFs};
 #[cfg(feature = "embed-fastembed")]
 use anyhome::FastEmbedder;
 
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     // Assemble the agent authorization policy from `--agent-uid` flags and an
     // optional `--agent-creds` file. With no credentials at all the policy
     // collapses to Open (auth disabled) — backward compatible.
-    let policy = build_auth_policy(&cli)?;
+    let policy = anyhome::auth::build_auth_policy(&cli)?;
     let fs = AnyHomeFs::new(real, db, embedder).with_auth(policy);
 
     // Wire the export name into nfsserve so MOUNT enforces it: a client must
@@ -64,30 +64,6 @@ async fn main() -> Result<()> {
     );
     listener.handle_forever().await?;
     Ok(())
-}
-
-/// Build the agent authorization policy from CLI credential sources.
-///
-/// Merges repeated `--agent-uid <id:uid>` flags with an optional
-/// `--agent-creds <file>`. An empty credential set yields [`AuthPolicy::Open`]
-/// (auth disabled). Duplicate `(agent_id, uid)` bindings are de-duplicated by
-/// the policy's set semantics.
-fn build_auth_policy(cli: &Cli) -> Result<AuthPolicy> {
-    let mut creds = cli.agent_uid.clone();
-    if let Some(path) = &cli.agent_creds {
-        let file_creds = anyhome::auth::parse_creds_file(path)
-            .map_err(|e| anyhow::anyhow!("--agent-creds {path:?}: {e}"))?;
-        creds.extend(file_creds);
-    }
-    if creds.is_empty() {
-        tracing::info!("no agent credentials configured — authorization disabled (Open policy)");
-    } else {
-        tracing::info!(
-            "authorization enabled: {} agent credential binding(s)",
-            creds.len()
-        );
-    }
-    Ok(AuthPolicy::from_creds(&creds))
 }
 
 /// Resolve the configured embedder and the dimension it implies.

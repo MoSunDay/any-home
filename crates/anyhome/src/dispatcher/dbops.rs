@@ -25,12 +25,18 @@ impl AnyHomeFs {
             .embedder
             .embed(query)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|e| {
+                tracing::warn!(op = "search:embed", error = %e, "embed failed; mapping to NFS3ERR_IO");
+                nfsstat3::NFS3ERR_IO
+            })?;
         let rows = self
             .db
             .search(agent_id, &emb, k)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|e| {
+                tracing::warn!(op = "search:query", error = %e, "db op failed; mapping to NFS3ERR_IO");
+                nfsstat3::NFS3ERR_IO
+            })?;
         let mut out = String::new();
         for (key, text) in rows {
             out.push_str(&format!("{}\t{}\n", key, text));
@@ -53,11 +59,17 @@ impl AnyHomeFs {
             .embedder
             .embed(text)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|e| {
+                tracing::warn!(op = "index:embed", error = %e, "embed failed; mapping to NFS3ERR_IO");
+                nfsstat3::NFS3ERR_IO
+            })?;
         self.db
             .upsert(agent_id, key, text, &emb)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|e| {
+                tracing::warn!(op = "index:upsert", error = %e, "db op failed; mapping to NFS3ERR_IO");
+                nfsstat3::NFS3ERR_IO
+            })?;
         Ok(text.len() as u64)
     }
 
@@ -76,7 +88,10 @@ impl AnyHomeFs {
             .db
             .where_search(agent_id, cond, DEFAULT_K)
             .await
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?
+            .map_err(|e| {
+                tracing::warn!(op = "where:query", error = %e, "db op failed; mapping to NFS3ERR_IO");
+                nfsstat3::NFS3ERR_IO
+            })?
         {
             WhereOutcome::Rows(rows) => {
                 for (key, text) in rows {
@@ -99,7 +114,10 @@ impl AnyHomeFs {
         match self.db.get_text(agent_id, key).await {
             Ok(Some(text)) => Ok(text.into_bytes()),
             Ok(None) => Ok(format!("# no indexed memory under key: {}\n", key).into_bytes()),
-            Err(_) => Err(nfsstat3::NFS3ERR_IO),
+            Err(e) => {
+                tracing::warn!(op = "index_text:get_text", error = %e, "db op failed; mapping to NFS3ERR_IO");
+                Err(nfsstat3::NFS3ERR_IO)
+            }
         }
     }
 

@@ -23,6 +23,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
+use crate::cli::Cli;
+
 /// Caller credential derived from the NFS RPC AUTH_SYS flavor.
 ///
 /// `uid == 0` denotes an *anonymous* caller — either no AUTH_SYS credential was
@@ -176,9 +178,38 @@ pub fn parse_creds_text(raw: &str) -> Result<Vec<AgentCred>, String> {
     Ok(out)
 }
 
+/// CLI-policy assembly half: build the [`AuthPolicy`] from the CLI credential
+/// sources.
+///
+/// Merges repeated `--agent-uid <id:uid>` flags with the entries of an
+/// optional `--agent-creds <file>` (flags ∪ file). An empty credential set
+/// yields [`AuthPolicy::Open`] (auth disabled — backward compatible).
+/// Duplicate `(agent_id, uid)` bindings are de-duplicated by the policy's set
+/// semantics. A missing or malformed creds file is an error, wrapped with the
+/// offending path for operator-friendly diagnostics.
+pub fn build_auth_policy(cli: &Cli) -> anyhow::Result<AuthPolicy> {
+    let mut creds = cli.agent_uid.clone();
+    if let Some(path) = &cli.agent_creds {
+        let file_creds =
+            parse_creds_file(path).map_err(|e| anyhow::anyhow!("--agent-creds {path:?}: {e}"))?;
+        creds.extend(file_creds);
+    }
+    if creds.is_empty() {
+        tracing::info!("no agent credentials configured — authorization disabled (Open policy)");
+    } else {
+        tracing::info!(
+            "authorization enabled: {} agent credential binding(s)",
+            creds.len()
+        );
+    }
+    Ok(AuthPolicy::from_creds(&creds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use clap::Parser;
 
     fn cred(uid: u32) -> CallerCred {
         CallerCred { uid }
@@ -278,5 +309,110 @@ mod tests {
     fn is_anonymous_flag() {
         assert!(cred(0).is_anonymous());
         assert!(!cred(1).is_anonymous());
+    }
+
+    // ---- build_auth_policy (CLI assembly half) ------------------------------
+
+    /// Helper: parse CLI args exactly as the binary would (all other args have
+    /// defaults, so only the auth-related flags need to be passed).
+    fn cli_from(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("valid CLI args")
+    }
+
+    #[test]
+    fn build_policy_from_flags_only_is_enforced() {
+        let cli = cli_from(&["anyhome", "--agent-uid", "botA:1001"]);
+        let p = build_auth_policy(&cli).unwrap();
+        assert!(p.is_enforced());
+        assert!(p.permits(cred(1001), "botA"));
+        assert!(!p.permits(cred(1002), "botA")); // wrong uid denied
+        assert!(!p.permits(cred(1001), "botB")); // wrong agent denied
+    }
+
+    #[test]
+    fn build_policy_from_creds_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.txt");
+        std::fs::write(&path, "botA:1001\nbotB:1002\n").unwrap();
+        let cli = cli_from(&["anyhome", "--agent-creds", path.to_str().unwrap()]);
+        let p = build_auth_policy(&cli).unwrap();
+        assert!(p.is_enforced());
+        assert!(p.permits(cred(1001), "botA"));
+        assert!(p.permits(cred(1002), "botB"));
+        assert!(!p.permits(cred(1001), "botB")); // impersonation blocked
+    }
+
+    #[test]
+    fn build_policy_dedups_identical_flag_and_file_binding() {
+        // The same binding from both sources must merge cleanly (BTreeSet
+        // dedup) — no error, still Enforced.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.txt");
+        std::fs::write(&path, "botA:1001\n").unwrap();
+        let cli = cli_from(&[
+            "anyhome",
+            "--agent-uid",
+            "botA:1001",
+            "--agent-creds",
+            path.to_str().unwrap(),
+        ]);
+        let p = build_auth_policy(&cli).unwrap();
+        assert!(p.is_enforced());
+        assert!(p.permits(cred(1001), "botA"));
+    }
+
+    #[test]
+    fn build_policy_unions_flag_and_file_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.txt");
+        std::fs::write(&path, "botB:1002\n").unwrap();
+        let cli = cli_from(&[
+            "anyhome",
+            "--agent-uid",
+            "botA:1001",
+            "--agent-creds",
+            path.to_str().unwrap(),
+        ]);
+        let p = build_auth_policy(&cli).unwrap();
+        assert!(p.is_enforced());
+        assert!(p.permits(cred(1001), "botA")); // from the flag
+        assert!(p.permits(cred(1002), "botB")); // from the file
+        assert!(!p.permits(cred(9999), "botA")); // unregistered uid denied
+        assert!(!p.permits(cred(9999), "botB"));
+    }
+
+    #[test]
+    fn build_policy_no_sources_is_open() {
+        let cli = cli_from(&["anyhome"]);
+        let p = build_auth_policy(&cli).unwrap();
+        assert!(!p.is_enforced());
+        assert!(p.permits(cred(0), "anything")); // Open permits everyone
+        assert!(p.permits(cred(9999), "botZ"));
+    }
+
+    #[test]
+    fn build_policy_missing_creds_file_names_path_in_error() {
+        let missing = "/definitely/not/here/creds.txt";
+        let cli = cli_from(&["anyhome", "--agent-creds", missing]);
+        let err = build_auth_policy(&cli).unwrap_err().to_string();
+        assert!(
+            err.contains(missing),
+            "error should name the missing path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_policy_malformed_creds_file_names_path_in_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.txt");
+        // uid 0 is rejected by parse_creds_text, so the file is malformed.
+        std::fs::write(&path, "botA:0\n").unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        let cli = cli_from(&["anyhome", "--agent-creds", &path_str]);
+        let err = build_auth_policy(&cli).unwrap_err().to_string();
+        assert!(
+            err.contains(&path_str),
+            "error should name the malformed path, got: {err}"
+        );
     }
 }
