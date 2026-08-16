@@ -9,8 +9,16 @@ use super::{vec_to_json, MemoryDb, RowGet, WhereOutcome};
 
 impl MemoryDb {
     /// Return up to `k` nearest memories `(key, text)` for `agent_id`, ordered
-    /// by ascending cosine distance to `query_emb`. The vector index is global;
-    /// results are filtered by agent_id after the KNN lookup.
+    /// by ascending cosine distance to `query_emb`.
+    ///
+    /// Scoped exact KNN: distances are computed only over the agent's own rows
+    /// (init-pro-12 TODO-68 defect E). The previous shape ran
+    /// `vector_top_k(..., k)` over the GLOBAL index and filtered by agent
+    /// afterwards, so other agents' nearer rows consumed the k slots and an
+    /// agent-scoped query could come back empty despite having memories
+    /// (proven by `/agents/<id>/search_k1` in e2e facet 6). Brute-force cosine
+    /// over one agent's partition is exact and cheap at memory-store scale;
+    /// `id` breaks distance ties deterministically.
     pub async fn search(
         &self,
         agent_id: &str,
@@ -21,14 +29,14 @@ impl MemoryDb {
         let mut rows = self
             .conn
             .query(
-                "SELECT m.key, m.text \
-                 FROM vector_top_k('memories_vec_idx', vector(?), ?) v \
-                 JOIN memories m ON m.rowid = v.id \
-                 WHERE m.agent_id = ?",
-                params![json, k, agent_id],
+                "SELECT key, text FROM memories \
+                 WHERE agent_id = ? AND emb IS NOT NULL \
+                 ORDER BY vector_distance_cos(emb, vector(?)) ASC, id ASC \
+                 LIMIT ?",
+                params![agent_id, json, k],
             )
             .await
-            .context("vector_top_k query")?;
+            .context("scoped knn query")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.context("fetch search row")? {
             out.push((row.get_key()?, row.get_text()?));

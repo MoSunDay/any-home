@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use nfsserve::nfs::{filename3, nfsstat3, sattr3};
+use nfsserve::nfs::{filename3, nfsstat3, sattr3, set_size3};
 use nfsserve::vfs::NFSFileSystem;
 use tempfile::tempdir;
 
@@ -186,14 +186,29 @@ async fn index_getattr_and_readdir_report_real_byte_size() {
 }
 
 #[tokio::test]
-async fn search_getattr_keeps_virtual_size() {
-    // /search content is dynamic per query: its size stays a virtual ceiling.
+async fn search_and_where_getattr_report_real_size() {
+    // TODO-70: query files must advertise their real content size. NFSv3
+    // clients treat the GETATTR size as authoritative EOF (RFC 1813) and
+    // zero-pad every READ up to it, so a virtual ceiling leaked NUL bytes
+    // past the end of every result (init-pro-12 TODO-70, proven live).
     let fs = make().await;
     let root = fs.root_dir();
+    index_doc(&fs, "greeting", b"hello anyhome").await;
+
     let search_dir = fs.lookup(root, &nm(b"search")).await.unwrap();
-    let id = fs.lookup(search_dir, &nm(b"anything")).await.unwrap();
+    let id = fs.lookup(search_dir, &nm(b"hello")).await.unwrap();
     let attr = fs.getattr(id).await.unwrap();
-    assert_eq!(attr.size, anyhome::magic::MAGIC_FILE_SIZE);
+    let (data, _eof) = fs.read(id, 0, 65536).await.unwrap();
+    assert_eq!(attr.size, data.len() as u64, "getattr size == readable bytes");
+    assert!(attr.size > 0, "matching query has non-empty content");
+    assert!(attr.size < anyhome::magic::MAGIC_FILE_SIZE, "no virtual ceiling");
+
+    // Same contract for /where.
+    let where_dir = fs.lookup(root, &nm(b"where")).await.unwrap();
+    let wid = fs.lookup(where_dir, &nm(b"hello")).await.unwrap();
+    let wattr = fs.getattr(wid).await.unwrap();
+    let (wdata, _eof) = fs.read(wid, 0, 65536).await.unwrap();
+    assert_eq!(wattr.size, wdata.len() as u64, "where getattr == readable bytes");
 }
 
 // ---- TODO-18: handles survive a restart ----
@@ -248,4 +263,101 @@ async fn index_write_rejects_invalid_utf8() {
 
     // Nothing was persisted under the key.
     assert!(fs.db.get_text("", "bin").await.unwrap().is_none());
+}
+
+// ---- TODO-70: SETATTR(size) truncate semantics (Defect B fix) ----
+
+async fn index_file(fs: &AnyHomeFs, key: &str) -> nfsserve::nfs::fileid3 {
+    let root = fs.root_dir();
+    let index_dir = fs.lookup(root, &nm(b"index")).await.unwrap();
+    fs.lookup(index_dir, &nm(key.as_bytes())).await.unwrap()
+}
+
+fn truncate_attr(size: u64) -> sattr3 {
+    sattr3 {
+        size: set_size3::size(size),
+        ..sattr3::default()
+    }
+}
+
+#[tokio::test]
+async fn setattr_truncate_shortens_persisted_text() {
+    let fs = make().await;
+    let id = index_file(&fs, "trunc").await;
+
+    fs.write(id, 0, b"ORIGINAL-CONTENT-MUCH-LONGER\n").await.unwrap();
+    fs.setattr(id, truncate_attr(6)).await.unwrap();
+
+    // The DB is authoritative: only the first 6 bytes survive.
+    let stored = fs.db.get_text("", "trunc").await.unwrap().unwrap();
+    assert_eq!(stored, "ORIGIN");
+    let attr = fs.getattr(id).await.unwrap();
+    assert_eq!(attr.size, 6, "post-truncate attr reports the new length");
+
+    // The stale buffer must not resurface: composing a fresh WRITE after the
+    // truncation extends the truncated text, not the original long one.
+    fs.write(id, 6, b"XYZ").await.unwrap();
+    let stored = fs.db.get_text("", "trunc").await.unwrap().unwrap();
+    assert_eq!(stored, "ORIGINXYZ", "write after truncate composes over truncated buffer");
+}
+
+#[tokio::test]
+async fn setattr_truncate_to_zero_empties_memory() {
+    let fs = make().await;
+    let id = index_file(&fs, "zero").await;
+
+    fs.write(id, 0, b"some content to clear").await.unwrap();
+    fs.setattr(id, truncate_attr(0)).await.unwrap();
+
+    let stored = fs.db.get_text("", "zero").await.unwrap().unwrap();
+    assert_eq!(stored, "", "size=0 truncation empties the persisted text");
+    let attr = fs.getattr(id).await.unwrap();
+    assert_eq!(attr.size, 0);
+
+    // A subsequent write starts from empty — no stale tail (the `> file`
+    // regression, init-pro-12 TODO-70).
+    fs.write(id, 0, b"short").await.unwrap();
+    let stored = fs.db.get_text("", "zero").await.unwrap().unwrap();
+    assert_eq!(stored, "short");
+}
+
+#[tokio::test]
+async fn setattr_truncate_past_eof_is_noop() {
+    let fs = make().await;
+    let id = index_file(&fs, "grow").await;
+
+    fs.write(id, 0, b"hello").await.unwrap();
+    let attr = fs.setattr(id, truncate_attr(999)).await.unwrap();
+
+    let stored = fs.db.get_text("", "grow").await.unwrap().unwrap();
+    assert_eq!(stored, "hello", "growing truncate leaves text content unchanged");
+    // The reported size is the persisted length, never the requested size:
+    // advertising 999 would re-introduce the NUL-padding hazard.
+    assert_eq!(attr.size, 5);
+}
+
+#[tokio::test]
+async fn setattr_truncate_survives_restart() {
+    let dir = tempdir().expect("tempdir").keep();
+    let db_path = dir.join("mem.db");
+    let fs_root = dir.join("fs");
+    std::fs::create_dir_all(&fs_root).unwrap();
+
+    {
+        let real = RealFs::new(fs_root.clone()).unwrap();
+        let db = MemoryDb::open(db_path.to_str().unwrap(), 16).await.unwrap();
+        let emb: Arc<dyn Embedder> = Arc::new(DummyEmbedder::new(16));
+        let fs = AnyHomeFs::new(real, db, emb);
+        let id = index_file(&fs, "persist-trunc").await;
+        fs.write(id, 0, b"LONGER-THAN-THE-TRUNCATION").await.unwrap();
+        fs.setattr(id, truncate_attr(6)).await.unwrap();
+    }
+
+    // Fresh process, same db-path: the truncated text is what got persisted.
+    let real = RealFs::new(fs_root).unwrap();
+    let db = MemoryDb::open(db_path.to_str().unwrap(), 16).await.unwrap();
+    let emb: Arc<dyn Embedder> = Arc::new(DummyEmbedder::new(16));
+    let fs = AnyHomeFs::new(real, db, emb);
+    let stored = fs.db.get_text("", "persist-trunc").await.unwrap().unwrap();
+    assert_eq!(stored, "LONGER", "truncation survives a restart (write-through)");
 }

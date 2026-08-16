@@ -107,6 +107,12 @@ pub fn search_scoped_name(agent_id: &str, k: i64, query: &str) -> String {
     format!("{agent_id}\x00k{k}\x00{query}")
 }
 
+/// First `size` bytes of `data` (or all of it when shorter).
+pub fn truncated(data: &[u8], size: u64) -> Vec<u8> {
+    let n = size.min(data.len() as u64) as usize;
+    data[..n].to_vec()
+}
+
 pub fn magic_file_id(cat: u8, scoped_name: &str) -> fileid3 {
     let h = fnv1a_64(scoped_name.as_bytes()) & HASH_MASK;
     MAGIC | ((cat as u64) << CAT_SHIFT) | h
@@ -385,6 +391,30 @@ impl MagicRegistry {
         bufs.enforce_caps();
         out
     }
+
+    /// Replace the write buffer for `id` with the first `size` bytes of
+    /// `source` (or all of it when shorter), returning the truncated bytes.
+    /// Used by SETATTR(size) on CAT_INDEX files (TODO-70): without this the
+    /// stale buffer from a previous write would compose over the truncation
+    /// and persist the old tail bytes.
+    pub fn truncate_buffer(&self, id: fileid3, size: u64, source: &[u8]) -> Vec<u8> {
+        let data = truncated(source, size);
+        {
+            let mut bufs = guard(&self.buffers);
+            bufs.tick = bufs.tick.wrapping_add(1);
+            let tick = bufs.tick;
+            bufs.total_bytes += data.len();
+            bufs.map.insert(id, BufferEntry { data, last_used: tick });
+            bufs.enforce_caps();
+        }
+        // Re-read after caps: the fresh entry may already be the eviction
+        // victim (byte cap), in which case the DB remains authoritative.
+        guard(&self.buffers)
+            .map
+            .get(&id)
+            .map(|e| e.data.clone())
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -539,5 +569,39 @@ mod tests {
         assert_eq!(reg.list_for_cat(CAT_WHERE, "").len(), 1);
         reg.forget(q);
         assert!(reg.get(q).is_none(), "forget works on a poisoned lock pair");
+    }
+
+    #[test]
+    fn truncated_helper_bounds() {
+        assert_eq!(truncated(b"hello", 3), b"hel");
+        assert_eq!(truncated(b"hello", 5), b"hello");
+        assert_eq!(truncated(b"hello", 99), b"hello");
+        assert_eq!(truncated(b"", 99), b"");
+    }
+
+    #[test]
+    fn truncate_buffer_replaces_stale_content() {
+        let reg = MagicRegistry::default();
+        let id = magic_file_id(CAT_INDEX, "k");
+        reg.write_into(id, 0, b"ORIGINAL-CONTENT-LONGER");
+        // Truncate shorter than both the seed and the stale buffer.
+        let out = reg.truncate_buffer(id, 6, b"short\nORIGINAL-CONTENT-LONGER");
+        assert_eq!(out, b"short\n");
+        // Subsequent WRITE composes over the truncated buffer, not the stale one.
+        let composed = reg.write_into(id, 6, b"tail");
+        assert_eq!(composed, b"short\ntail");
+    }
+
+    #[test]
+    fn truncate_buffer_grow_is_noop_then_replace() {
+        let reg = MagicRegistry::default();
+        let id = magic_file_id(CAT_INDEX, "k");
+        reg.write_into(id, 0, b"old");
+        // Size >= source len keeps the full source.
+        let out = reg.truncate_buffer(id, 999, b"brand-new");
+        assert_eq!(out, b"brand-new");
+        // Zero-size truncation empties the buffer.
+        let out = reg.truncate_buffer(id, 0, b"brand-new");
+        assert_eq!(out, b"");
     }
 }

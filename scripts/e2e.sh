@@ -231,6 +231,141 @@ if grep -q "agent B memory" "$A_WHERE"; then
     echo "FAIL: botA scoped /where leaked botB content"; exit 1
 fi
 
+# ---- TODO-68 facets: coverage for the six uncovered magic surfaces ---------
+
+# Facet 1: /index/<key> readback reports the TRUE size (TODO-70 Defect A fix).
+# GETATTR must advertise exactly the stored byte count: NFSv3 clients treat
+# the attr size as authoritative EOF (RFC 1813) and zero-pad every READ up to
+# it, so a virtual size leaks NUL bytes past the end of the content.
+echo "==> facet: /index/<key> readback + true attr size"
+printf 'exact size payload\n' > "$MNT/index/size-key"
+EXPECT_LEN="$(printf 'exact size payload\n' | wc -c)"
+STAT_LEN="$(stat -c %s "$MNT/index/size-key")"
+READ_LEN="$(wc -c < "$MNT/index/size-key")"
+echo "    expected=$EXPECT_LEN stat=$STAT_LEN read=$READ_LEN"
+if [ "$STAT_LEN" != "$EXPECT_LEN" ] || [ "$READ_LEN" != "$EXPECT_LEN" ]; then
+    echo "FAIL: /index/size-key attr/read length != content length (NUL-padding hazard)"; exit 1
+fi
+if ! cmp -s "$MNT/index/size-key" <(printf 'exact size payload\n'); then
+    echo "FAIL: /index/size-key readback differs from written content"; exit 1
+fi
+
+# Query files too: /search and /where attr size must equal the readable bytes,
+# never the 1 MiB virtual size (pre-fix: stat=1048576 and cat NUL-padded).
+QSIZE_STAT="$(stat -c %s "$MNT/where/key:gre")"
+QSIZE_READ="$(wc -c < "$MNT/where/key:gre")"
+if [ "$QSIZE_STAT" != "$QSIZE_READ" ] || [ "$QSIZE_STAT" -ge 1048576 ]; then
+    echo "FAIL: /where attr size ($QSIZE_STAT) != read bytes ($QSIZE_READ) or still virtual"; exit 1
+fi
+
+# Facet 2: overwrite semantics (TODO-70 Defect B fix). Replacing a long text
+# with a shorter one must not persist the stale tail, and O_TRUNC (shell `>`)
+# must empty the memory.
+echo "==> facet: overwrite + O_TRUNC leave no stale tail"
+printf 'ORIGINAL-CONTENT-MUCH-LONGER-THAN-THE-REPLACEMENT\n' > "$MNT/index/overwrite-key"
+echo short > "$MNT/index/overwrite-key"
+if grep -q "ORIGINAL" "$MNT/index/overwrite-key"; then
+    echo "FAIL: overwrite kept stale tail bytes (SETATTR size=0 was ignored)"; exit 1
+fi
+if ! cmp -s "$MNT/index/overwrite-key" <(printf 'short\n'); then
+    echo "FAIL: overwriting a longer memory must yield exactly the new bytes"; exit 1
+fi
+if [ "$(stat -c %s "$MNT/index/overwrite-key")" != "6" ]; then
+    echo "FAIL: overwritten memory attr size must be the new length"; exit 1
+fi
+: > "$MNT/index/overwrite-key"   # O_TRUNC -> SETATTR(size=0)
+if [ -s "$MNT/index/overwrite-key" ]; then
+    echo "FAIL: '> /index/<key>' must truncate to empty"; exit 1
+fi
+echo short > "$MNT/index/overwrite-key"   # final state checked again post-restart
+
+# Facet 3: rm triple-check (NFS enumeration, /where prefix query, DB rows).
+echo "==> facet: rm removes the memory everywhere (ls + /where + DB)"
+echo "temp memory to delete" > "$MNT/index/delete-me"
+rm "$MNT/index/delete-me"
+if ls "$MNT/index/" | grep -q "^delete-me$"; then
+    echo "FAIL: delete-me still listed under /index after rm"; exit 1
+fi
+if [ -s "$MNT/where/key:delete-me" ]; then
+    echo "FAIL: /where/key:delete-me still returns rows after rm"; exit 1
+fi
+PYBIN="$(command -v python3.10 || command -v python3 || true)"
+if [ -n "$PYBIN" ]; then
+    DB_LEFT="$("$PYBIN" - "$WORK/mem.db" << 'PYCHECK'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+rows = con.execute(
+    "SELECT count(*) FROM memories WHERE agent_id='' AND key='delete-me'"
+).fetchone()[0]
+fts = con.execute(
+    "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH 'temp'"
+).fetchone()[0]
+print(f"{rows}+{fts}")
+PYCHECK
+)"
+    echo "    db rows for delete-me: ${DB_LEFT} (memories+fts matches)"
+    if [ "$DB_LEFT" != "0+0" ]; then
+        echo "FAIL: delete-me left DB/FTS residue after rm ($DB_LEFT)"; exit 1
+    fi
+else
+    echo "    (no python available: skipping DB-level triple-check)"
+fi
+
+# Facet 4: real-file lifecycle on the backing FS ($WORK/fs), not a magic path.
+echo "==> facet: plain file create/read/delete on the real FS"
+echo "plain file on real fs" > "$MNT/plain.txt"
+if ! cmp -s "$MNT/plain.txt" <(echo "plain file on real fs"); then
+    echo "FAIL: plain file readback differs"; exit 1
+fi
+if [ ! -e "$WORK/fs/plain.txt" ]; then
+    echo "FAIL: plain file not materialized in fs-root"; exit 1
+fi
+rm "$MNT/plain.txt"
+if [ -e "$WORK/fs/plain.txt" ]; then
+    echo "FAIL: plain file still on disk after rm"; exit 1
+fi
+if ls "$MNT/" | grep -q "^plain.txt$"; then
+    echo "FAIL: plain.txt still listed after rm"; exit 1
+fi
+
+# Facet 5: unicode round-trip — stored text, /search and /where with UTF-8
+# queries (percent-encoded on the wire).
+echo "==> facet: unicode memory + UTF-8 queries"
+UNI_TEXT="café 记忆 ünïcode"
+printf '%s\n' "$UNI_TEXT" > "$MNT/index/unicode-key"
+if ! cmp -s "$MNT/index/unicode-key" <(printf '%s\n' "$UNI_TEXT"); then
+    echo "FAIL: unicode readback differs"; exit 1
+fi
+U_SEARCH="$MNT/search/caf%C3%A9%20%E8%AE%B0%E5%BF%86%20%C3%BCn%C3%AFcode"
+if ! grep -q "^unicode-key${T}" "$U_SEARCH"; then
+    echo "FAIL: /search with UTF-8 query did not find unicode-key"; exit 1
+fi
+U_WHERE="$MNT/where/%E8%AE%B0%E5%BF%86"
+if ! grep -q "^unicode-key${T}" "$U_WHERE"; then
+    echo "FAIL: /where with UTF-8 term did not find unicode-key"; exit 1
+fi
+
+# Facet 6: /search_k<N> — global and agent-scoped k-limited KNN.
+echo "==> facet: /search_k<N> caps results (global + agent-scoped)"
+SK_GLOBAL="$MNT/search_k2/hello%20anyhome"
+cat "$SK_GLOBAL" || echo "    (cat failed rc=$?)"
+if ! grep -q "^greeting${T}" "$SK_GLOBAL"; then
+    echo "FAIL: /search_k2 must still rank the exact match"; exit 1
+fi
+# Non-empty lines: each stored text keeps its trailing newline, so result
+# rows render with a blank line between them.
+if [ "$(grep -vc '^$' "$SK_GLOBAL" || true)" -gt 2 ]; then
+    echo "FAIL: /search_k2 returned more than 2 rows"; exit 1
+fi
+SK_AGENT="$MNT/agents/botA/search_k1/agent%20memory"
+cat "$SK_AGENT"
+if ! grep -q "^greeting${T}agent A memory$" "$SK_AGENT"; then
+    echo "FAIL: agent-scoped search_k1 must return botA's exact match"; exit 1
+fi
+if grep -q "agent B memory" "$SK_AGENT"; then
+    echo "FAIL: botA search_k1 leaked botB content"; exit 1
+fi
+
 # ---- restart persistence -----------------------------------------------------
 echo "==> testing persistence: unmount -> restart server -> remount"
 umount -f "$MNT" 2>/dev/null || true
@@ -257,6 +392,14 @@ if ! grep -q "^greeting${T}" "$RESTART_WHERE"; then
 fi
 if ! grep -q "^second${T}" "$RESTART_WHERE"; then
     echo "FAIL: 'second' missing from /where after restart — persistence broken"; exit 1
+fi
+
+echo "==> asserting overwrite truncation + rm survived the restart (TODO-70)"
+if ! cmp -s "$MNT/index/overwrite-key" <(printf 'short\n'); then
+    echo "FAIL: post-restart readback of overwrite-key must be the truncated text"; exit 1
+fi
+if [ -s "$MNT/where/key:delete-me" ]; then
+    echo "FAIL: delete-me resurrected after restart"; exit 1
 fi
 
 # ---- auth live test (soft AUTH_SYS authorization) ---------------------------
@@ -299,4 +442,4 @@ if ls "$MNT2/agents/" 2>/dev/null | grep -q "botA"; then
     echo "FAIL: /agents/ listing leaked botA to unauthorized caller"; exit 1
 fi
 
-echo "PASS: index/search/where + where-prefix + agent-where + persistence + auth + export-name enforcement live all green over NFSv3"
+echo "PASS: index/search/where + where-prefix + agent-where + true-size + overwrite-truncate + rm-triple-check + real-file + unicode + search_k + persistence + auth + export-name enforcement live all green over NFSv3"

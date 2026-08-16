@@ -17,13 +17,12 @@
 //! have no `MemoryDb` public-API surface; the reopen test below substitutes a
 //! portable "results unchanged across close/reopen" invariant for them.
 //!
-//! Empirically pinned anyhome deltas vs the libSQL suite (per-test comments):
-//! - `search` emits matched rows in (agent_id, key) index order, not distance
-//!   order; the cosine-correct top-k *selection* is still asserted per k.
-//! - `search(.., k=0)` aborts the process (heap corruption in the bundled
-//!   vector index), so it is pinned via a child process.
-//! - agent filtering happens AFTER the global top-k, so a scoped search can
-//!   return fewer than k rows even when the agent has more rows.
+//! Contract pins vs the libSQL suite (per-test comments), updated by
+//! init-pro-12 TODO-68 (defect E): `MemoryDb::search` is a scoped exact KNN
+//! over `vector_distance_cos` — nearest-first output, `id ASC` distance
+//! tie-break, agent rows never starved by other agents' rows, and k=0 is a
+//! harmless empty result (the old global-`vector_top_k` shape, whose k=0 heap
+//! corruption and post-filter starvation this file used to pin, is gone).
 
 use std::collections::BTreeSet;
 
@@ -43,27 +42,24 @@ async fn seed_backfill(db: &MemoryDb) {
     db.upsert("", "k4", "t4", &[4.0, 5.0, 6.0]).await.unwrap();
 }
 
-/// `vector-backfill` expects raw `vector_top_k` to return rowids `{3 4 2 1}`
-/// for query [3,4,5] — the raw vtab in this build still does, but
-/// `MemoryDb::search` JOINs the vtab against `memories` and the SQLite planner
-/// drives that join from `sqlite_autoindex_memories_1 (agent_id=?)` (verified
-/// via EXPLAIN QUERY PLAN), so matched rows come back KEY-sorted rather than
-/// distance-sorted. The cosine-correct top-k selection is the preserved part
-/// of the contract and is pinned here per k; the key-ordered emission is the
-/// pinned anyhome delta (cosine distances of [3,4,5]: k3=0, k4~7.8e-4,
-/// k2~2.1e-3, k1~1.7e-2).
+/// `vector-backfill` expects rowids `{3 4 2 1}` for query [3,4,5] (cosine
+/// distances: k3=0, k4~7.8e-4, k2~2.1e-3, k1~1.7e-2). init-pro-12 TODO-68:
+/// `MemoryDb::search` now computes scoped exact KNN with `vector_distance_cos`
+/// over the agent's own rows (it no longer JOINs the global `vector_top_k`
+/// vtab), so the same cosine-correct selection comes back NEAREST-FIRST
+/// instead of in the old key order.
 #[tokio::test]
-async fn backfill_top_k_selection_is_cosine_correct_output_key_ordered() {
+async fn backfill_top_k_selection_is_cosine_correct_nearest_first() {
     let db = MemoryDb::open(":memory:", 3).await.expect("open db");
     seed_backfill(&db).await;
 
     let r = db.search("", &[3.0, 4.0, 5.0], 2).await.unwrap();
     assert_eq!(keys(&r), vec!["k3", "k4"], "top-2 = two closest vectors");
     let r = db.search("", &[3.0, 4.0, 5.0], 3).await.unwrap();
-    assert_eq!(keys(&r), vec!["k2", "k3", "k4"], "top-3, key-ordered (not k3,k4,k2)");
+    assert_eq!(keys(&r), vec!["k3", "k4", "k2"], "top-3, distance-ordered");
     let r = db.search("", &[3.0, 4.0, 5.0], 4).await.unwrap();
-    assert_eq!(keys(&r), vec!["k1", "k2", "k3", "k4"], "top-4, key-ordered (not k3,k4,k2,k1)");
-    assert_eq!(r[0].1, "t1", "text round-trips through search");
+    assert_eq!(keys(&r), vec!["k3", "k4", "k2", "k1"], "top-4, distance-ordered");
+    assert_eq!(r[3].1, "t1", "text round-trips through search");
 }
 
 /// `vector-update`: swapping the vectors of two rows flips top-1, and an
@@ -121,13 +117,11 @@ async fn search_on_empty_table_returns_empty_without_error() {
 }
 
 /// `vector-index-v2-query-4`: query [-1,1,1,1] is exactly equidistant (cosine
-/// distance 1.5) from b=[-100,-100,-100,-100] and c=[10,10,-10,-10]. libSQL's
-/// ANN index breaks the tie by ascending rowid in this build, admitting b
-/// (inserted before c) — the original suite pins exactly that. libSQL gives no
-/// cross-version stability guarantee for the tie-break, so we only pin
-/// within-build determinism: identical input queries return an identical
-/// sequence. (Output is again key-ordered, hence [a,b,d], not the original
-/// distance order [d,a,b].)
+/// distance 1.5) from b=[-100,-100,-100,-100] and c=[10,10,-10,-10]. Since
+/// init-pro-12 TODO-68, `MemoryDb::search` breaks distance ties explicitly by
+/// ascending row id (`ORDER BY distance ASC, id ASC`), so b — inserted before
+/// c — wins the tie in every build, and rows come back nearest-first:
+/// [d, a, b]. Within-build determinism is still pinned by repeating the query.
 #[tokio::test]
 async fn equidistant_tie_break_is_deterministic_within_a_build() {
     let db = MemoryDb::open(":memory:", 4).await.unwrap();
@@ -138,35 +132,37 @@ async fn equidistant_tie_break_is_deterministic_within_a_build() {
 
     let q = [-1.0, 1.0, 1.0, 1.0];
     let first = db.search("", &q, 3).await.unwrap();
-    assert_eq!(keys(&first), vec!["a", "b", "d"], "d,a nearest; rowid tie-break admits b");
+    assert_eq!(keys(&first), vec!["d", "a", "b"], "distance order; id tie-break admits b over c");
     for _ in 0..4 {
         let again = db.search("", &q, 3).await.unwrap();
         assert_eq!(keys(&again), keys(&first), "tie-break must be stable across repeated queries");
     }
 }
 
-/// k larger than the live row count returns every row, no error, no padding.
+/// k larger than the live row count returns every row (nearest-first), no
+/// error, no padding.
 #[tokio::test]
 async fn k_larger_than_row_count_returns_every_row() {
     let db = MemoryDb::open(":memory:", 3).await.unwrap();
     seed_backfill(&db).await;
     let r = db.search("", &[3.0, 4.0, 5.0], 10).await.unwrap();
-    assert_eq!(keys(&r), vec!["k1", "k2", "k3", "k4"]);
+    assert_eq!(keys(&r), vec!["k3", "k4", "k2", "k1"], "all rows, distance-ordered");
     assert_eq!(r.len(), 4);
 }
 
-/// Dimension mismatch is an Err (measured: not a panic). libSQL reports
-/// `vector index(search): dimensions are different: 2 != 3` verbatim through
-/// anyhome's error chain; a wrong-dim upsert fails the same way, and the
-/// connection stays usable afterwards.
+/// Dimension mismatch is an Err (measured: not a panic). Since init-pro-12
+/// TODO-68, search runs the cosine distance path, which reports
+/// `vector_distance: vectors must have the same length: 3 != 2`; the upsert
+/// path still goes through the vector32 insert and keeps libSQL's
+/// `dimensions are different` wording. The connection stays usable afterwards.
 #[tokio::test]
-async fn dim_mismatch_errors_contain_dimensions_are_different() {
+async fn dim_mismatch_errors_report_expected_and_actual_dimensions() {
     let db = MemoryDb::open(":memory:", 3).await.unwrap();
     db.upsert("", "k", "t", &[1.0, 2.0, 3.0]).await.unwrap();
 
     let err = db.search("", &[1.0, 2.0], 2).await.expect_err("search dim mismatch must fail");
     let msg = format!("{err:#}");
-    assert!(msg.contains("dimensions are different"), "{msg}");
+    assert!(msg.contains("vectors must have the same length: 3 != 2"), "{msg}");
 
     let err = db.upsert("", "bad", "t", &[1.0, 2.0]).await.expect_err("upsert dim mismatch must fail");
     assert!(format!("{err:#}").contains("dimensions are different"));
@@ -195,24 +191,26 @@ async fn reopen_file_db_keeps_search_results_unchanged() {
     assert_eq!(after, before, "texts invariant across reopen");
 }
 
-/// Anyhome-specific contract (`MemoryDb::search` docs): the vector index is
-/// GLOBAL and agent filtering happens AFTER the top-k lookup, so a scoped
-/// search can return fewer than k rows — even zero — when other agents' rows
-/// occupy every top-k slot. libSQL's single-tenant suite has no analogue.
+/// Inverted by init-pro-12 TODO-68 (defect E): this test used to pin the OLD
+/// broken semantics — `MemoryDb::search` ran `vector_top_k` over the GLOBAL
+/// index and filtered by agent afterwards, so other agents' nearer rows
+/// consumed all k slots and a scoped search came back empty (or short).
+/// Search is now a scoped exact KNN, so foreign rows can never starve the
+/// result: an agent always gets its k nearest rows (or all of them if fewer).
 #[tokio::test]
-async fn agent_filter_after_global_top_k_may_return_fewer_rows() {
+async fn scoped_search_is_not_starved_by_other_agents_rows() {
     let db = MemoryDb::open(":memory:", 3).await.unwrap();
     db.upsert("a", "a1", "t", &[1.0, 0.0, 0.0]).await.unwrap();
     db.upsert("a", "a2", "t", &[0.99, 0.01, 0.0]).await.unwrap();
     db.upsert("a", "a3", "t", &[0.98, 0.02, 0.0]).await.unwrap();
     db.upsert("b", "b1", "t", &[0.0, 1.0, 0.0]).await.unwrap();
 
-    // Query [1,0,0]: agent a owns the three global nearest rows (distances 0,
-    // ~5e-5, ~2e-4); b's orthogonal row (distance 1) misses top-3 entirely.
-    assert_eq!(db.search("b", &[1.0, 0.0, 0.0], 3).await.unwrap(), vec![]);
+    // b's orthogonal row can no longer hide a's rows (or vice versa).
+    assert_eq!(keys(&db.search("b", &[1.0, 0.0, 0.0], 3).await.unwrap()), vec!["b1"]);
     assert_eq!(keys(&db.search("a", &[1.0, 0.0, 0.0], 3).await.unwrap()), vec!["a1", "a2", "a3"]);
-    // k=4 spans every row, so b's row surfaces again.
-    assert_eq!(keys(&db.search("b", &[1.0, 0.0, 0.0], 4).await.unwrap()), vec!["b1"]);
+    // k=1 on the agent with the nearer rows returns exactly one row — the
+    // exact defect-E shape that used to return zero.
+    assert_eq!(keys(&db.search("a", &[1.0, 0.0, 0.0], 1).await.unwrap()), vec!["a1"]);
 }
 
 /// Marsaglia xorshift32 — inlined to avoid a rand dependency; nonzero state in,
@@ -304,39 +302,17 @@ async fn fuzz_mixed_ops_never_return_deleted_or_foreign_keys() {
     assert_eq!(db.list_keys("").await.unwrap(), want);
 }
 
-/// Measured: `search(.., 0)` does not return at all — k=0 corrupts the heap in
-/// the bundled libSQL vector index and glibc aborts the process
-/// ("corrupted size vs. prev_size", SIGABRT). Running it in-process would kill
-/// this whole test binary, so the abort is pinned from a child process that
-/// re-executes only the guarded probe below. If libSQL ever fixes k=0, the
-/// child stops aborting and these assertions fail loudly (as intended).
-#[test]
-fn k0_search_aborts_the_process() {
-    use std::os::unix::process::ExitStatusExt;
-    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-        .args(["--exact", "k0_search_abort_probe_inner"])
-        .env("ANYHOME_K0_ABORT_PROBE", "1")
-        .output()
-        .expect("spawn child test process");
-    assert!(!out.status.success(), "k=0 search must not exit cleanly");
-    assert_eq!(
-        out.status.signal(),
-        Some(6), // SIGABRT from the glibc heap-corruption check
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// Only performs the fatal k=0 search when spawned by
-/// `k0_search_aborts_the_process` (env-guarded); in a normal `cargo test` run
-/// it is a no-op so the suite stays green.
+/// Inverted by init-pro-12 TODO-68 (defect E): this used to pin
+/// `search(.., 0)` SIGABRTing the process — k=0 corrupted the heap inside the
+/// bundled libSQL `vector_top_k` vtab. Search no longer calls that vtab
+/// (scoped `vector_distance_cos` KNN), so k=0 degenerates to `LIMIT 0` and
+/// simply returns nothing; the abort is no longer reachable through anyhome's
+/// API. Kept so any future re-routing through the broken vtab fails loudly
+/// (the test binary would die).
 #[tokio::test]
-async fn k0_search_abort_probe_inner() {
-    if std::env::var_os("ANYHOME_K0_ABORT_PROBE").is_none() {
-        return;
-    }
+async fn k0_search_returns_empty_without_abort() {
     let db = MemoryDb::open(":memory:", 3).await.unwrap();
     db.upsert("", "k", "t", &[1.0, 2.0, 3.0]).await.unwrap();
-    let _ = db.search("", &[1.0, 2.0, 3.0], 0).await; // aborts inside libsql
-    panic!("unreachable: k=0 search was expected to abort before returning");
+    assert_eq!(db.search("", &[1.0, 2.0, 3.0], 0).await.unwrap(), vec![]);
+    assert_eq!(db.list_keys("").await.unwrap(), vec!["k"], "db still usable after k=0");
 }

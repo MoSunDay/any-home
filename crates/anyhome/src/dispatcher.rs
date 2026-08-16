@@ -98,6 +98,15 @@ impl AnyHomeFs {
     }
 }
 
+/// Names at the fs root that always resolve to virtual magic dirs
+/// (`/search`, `/index`, `/where`, `/agents`, `/search_k<N>`).
+fn reserved_root_name(name: &[u8]) -> bool {
+    match name {
+        b"search" | b"index" | b"where" | b"agents" => true,
+        _ => parse_search_k(name).is_some(),
+    }
+}
+
 #[async_trait]
 impl NFSFileSystem for AnyHomeFs {
     fn capabilities(&self) -> VFSCapabilities {
@@ -213,6 +222,25 @@ impl NFSFileSystem for AnyHomeFs {
                 // restart semantics stay identical to init-pro-6.
                 return Ok(magic_attr_sized(id, 0));
             }
+            // TODO-70: SEARCH/WHERE content is computed per read and its length
+            // varies with DB state, so GETATTR must report the real size. NFSv3
+            // clients treat the attr size as authoritative EOF (RFC 1813) and
+            // zero-pad every READ up to it: the virtual 1 MiB size leaked a
+            // megabyte of NULs past the end of every query result (proven
+            // against the Linux client in init-pro-12 TODO-70). Unresolvable
+            // fileids keep the virtual attr: READ recomputes content and reports
+            // the true eof, so a rare registry miss stays cosmetic.
+            if magic_category(id) == CAT_SEARCH || magic_category(id) == CAT_WHERE {
+                if let Some(entry) = self.magic.get_entry(id) {
+                    self.require_agent(&entry.agent_id)?;
+                    let content = if magic_category(id) == CAT_SEARCH {
+                        self.run_search(&entry.agent_id, &entry.name, entry.k).await?
+                    } else {
+                        self.run_where(&entry.agent_id, &entry.name).await?
+                    };
+                    return Ok(magic_attr_sized(id, content.len() as u64));
+                }
+            }
             return Ok(magic_attr(id));
         }
         self.real.getattr(id).await
@@ -230,8 +258,39 @@ impl NFSFileSystem for AnyHomeFs {
                     CAT_INDEX => {
                         // Same gate as getattr: metadata of an agent's index
                         // file must not be reachable by unauthenticated callers.
-                        if let Some((agent_id, _)) = self.index_name_for(id).await {
+                        if let Some((agent_id, key)) = self.index_name_for(id).await {
                             self.require_agent(&agent_id)?;
+                            // TODO-70: `> /index/<key>` / O_TRUNC / truncate(2)
+                            // arrives as SETATTR(size=...). Without handling it,
+                            // the stale write buffer (seeded with the old text by
+                            // the WRITE path) composed over the truncation and
+                            // the next READ returned old tail bytes, persisting
+                            // corruption (proven live in init-pro-12 TODO-70).
+                            // Replace the buffer with the DB text truncated to
+                            // the requested size and persist via run_index, so
+                            // write-through + single-embed keep holding.
+                            if let set_size3::size(size) = setattr.size {
+                                let source = self
+                                    .db
+                                    .get_text(&agent_id, &key)
+                                    .await
+                                    .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                                    .unwrap_or_default();
+                                let buf = self
+                                    .magic
+                                    .truncate_buffer(id, size, source.as_bytes());
+                                // Same UTF-8 contract as WRITE: cutting inside a
+                                // multi-byte character is rejected rather than
+                                // silently rewriting content.
+                                let text =
+                                    String::from_utf8(buf).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
+                                // Report the persisted length, not the requested
+                                // size: truncating past EOF is a no-op for text,
+                                // and reporting more than the readable bytes would
+                                // re-introduce the NUL-padding hazard on GETATTR.
+                                let new_size = self.run_index(&agent_id, &key, &text).await?;
+                                return Ok(magic_attr_sized(id, new_size));
+                            }
                             return Ok(self.index_attr(id).await);
                         }
                         return Ok(magic_attr_sized(id, 0));
@@ -321,6 +380,9 @@ impl NFSFileSystem for AnyHomeFs {
         filename: &filename3,
         attr: sattr3,
     ) -> std::result::Result<(fileid3, fattr3), nfsstat3> {
+        if dirid == ROOT_ID && reserved_root_name(filename.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
@@ -337,6 +399,9 @@ impl NFSFileSystem for AnyHomeFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> std::result::Result<fileid3, nfsstat3> {
+        if dirid == ROOT_ID && reserved_root_name(filename.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
@@ -360,7 +425,37 @@ impl NFSFileSystem for AnyHomeFs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> std::result::Result<(fileid3, fattr3), nfsstat3> {
+        // Virtual dirs can never be created on disk. Linux may skip the
+        // LOOKUP of the final component of mkdir(2) (GNU `mkdir -p` does
+        // exactly that), so an unguarded fall-through leaks REAL dirs under
+        // fs-root that shadow the magic ones. Claim the name as existing:
+        // the client then re-resolves it via lookup(), which returns the
+        // magic fileid.
+        if dirid == ROOT_ID && reserved_root_name(dirname.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
+        if dirid == AGENTS_DIR {
+            let agent_id = percent_decode(dirname);
+            self.require_agent(&agent_id)?;
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         if is_magic(dirid) {
+            if magic_category(dirid) == CAT_AGENT {
+                let name = dirname.as_slice();
+                let canonical = name == b"search"
+                    || name == b"index"
+                    || name == b"where"
+                    || parse_search_k(name).is_some();
+                if canonical {
+                    let agent_id = self
+                        .magic
+                        .get_entry(dirid)
+                        .map(|e| e.agent_id)
+                        .unwrap_or_default();
+                    self.require_agent(&agent_id)?;
+                    return Err(nfsstat3::NFS3ERR_EXIST);
+                }
+            }
             return Err(nfsstat3::NFS3ERR_NOTSUPP);
         }
         self.real.mkdir(dirid, dirname).await
@@ -371,13 +466,21 @@ impl NFSFileSystem for AnyHomeFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> std::result::Result<(), nfsstat3> {
+        if dirid == ROOT_ID && reserved_root_name(filename.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
         if let Some(cat) = self.dir_category(dirid) {
             let name = percent_decode(filename);
             let agent_id = self.agent_id_of_dir(dirid);
             self.require_agent(&agent_id)?;
             let (id, _) = self.magic_file_in(dirid, &agent_id, &name, cat);
             if cat == CAT_INDEX {
-                let _ = self.db.delete(&agent_id, &name).await;
+                // TODO-70: surface delete errors in the log instead of
+                // swallowing them (behavior kept: the mapping is forgotten
+                // either way and REMOVE still succeeds).
+                if let Err(e) = self.db.delete(&agent_id, &name).await {
+                    tracing::warn!(key = %name, error = %e, "memory delete failed");
+                }
             }
             self.magic.forget(id);
             return Ok(());
@@ -392,6 +495,12 @@ impl NFSFileSystem for AnyHomeFs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> std::result::Result<(), nfsstat3> {
+        if to_dirid == ROOT_ID && reserved_root_name(to_filename.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
+        if from_dirid == ROOT_ID && reserved_root_name(from_filename.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_INVAL);
+        }
         if is_magic(from_dirid) || is_magic(to_dirid) {
             return Err(nfsstat3::NFS3ERR_NOTSUPP);
         }
@@ -407,6 +516,9 @@ impl NFSFileSystem for AnyHomeFs {
         symlink: &nfspath3,
         attr: &sattr3,
     ) -> std::result::Result<(fileid3, fattr3), nfsstat3> {
+        if dirid == ROOT_ID && reserved_root_name(linkname.as_slice()) {
+            return Err(nfsstat3::NFS3ERR_EXIST);
+        }
         if is_magic(dirid) {
             return Err(nfsstat3::NFS3ERR_NOTSUPP);
         }
@@ -433,6 +545,12 @@ impl NFSFileSystem for AnyHomeFs {
 
         // Root: real entries first, then the magic dirs (including /agents).
         let mut res = self.real.readdir(dirid, start_after, max_entries).await?;
+        if dirid == ROOT_ID {
+            // Real entries shadowed by the virtual dirs are unreachable via
+            // lookup(); hide them so the listing never shows duplicates.
+            res.entries
+                .retain(|e| !reserved_root_name(e.name.as_slice()));
+        }
         if dirid == ROOT_ID && res.end {
             for (id, name) in [
                 (SEARCH_DIR, b"search".as_slice()),

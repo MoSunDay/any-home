@@ -73,7 +73,10 @@ async fn magic_file_has_reg_attr_and_is_readable() {
     let q_id = fs.lookup(search_dir, &nm(b"anything")).await.unwrap();
 
     let attr = fs.getattr(q_id).await.unwrap();
-    assert_eq!(attr.size, anyhome::magic::MAGIC_FILE_SIZE, "magic file reports fixed size");
+    // TODO-70: query files report their real content size, not a virtual
+    // ceiling — an empty result is 0 bytes. (A virtual 1 MiB size made NFSv3
+    // clients NUL-pad every read up to the attr size, RFC 1813.)
+    assert_eq!(attr.size, 0, "empty query result reports size 0");
     // Reading /search on an empty index yields a valid (empty) body.
     let (data, _eof) = fs.read(q_id, 0, 4096).await.unwrap();
     assert!(String::from_utf8_lossy(&data).trim().is_empty(), "empty index -> empty result");

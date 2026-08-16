@@ -101,3 +101,46 @@ async fn agent_isolation_search() {
     assert_eq!(res_b[0].0, "x");
     assert_eq!(res_b[0].1, "b-text");
 }
+
+/// Defect E (init-pro-12 TODO-68): agent-scoped KNN must not be truncated by
+/// other agents' nearer rows. The old shape ran `vector_top_k(..., k)` over
+/// the GLOBAL index and filtered by agent afterwards, so a competitor holding
+/// distance-0 rows consumed all k slots and a scoped query returned empty
+/// even though the agent had memories (e2e: `/agents/botA/search_k1` came
+/// back empty once botB existed).
+#[tokio::test]
+async fn scoped_search_survives_other_agents_nearer_rows() {
+    let db = MemoryDb::open(":memory:", 3).await.unwrap();
+    // A rival agent owns the exact query vector (distance 0), twice.
+    db.upsert("rival", "q", "rival text", &[1.0, 0.0, 0.0])
+        .await
+        .unwrap();
+    db.upsert("rival", "q2", "rival text 2", &[1.0, 0.0, 0.0])
+        .await
+        .unwrap();
+    // The requesting agent's only row points elsewhere.
+    db.upsert("me", "mine", "my text", &[0.9, 0.1, 0.0])
+        .await
+        .unwrap();
+
+    // k=1 and k=2 used to come back empty for "me".
+    let res = db.search("me", &[1.0, 0.0, 0.0], 1).await.unwrap();
+    assert_eq!(res.len(), 1, "scoped k=1 must return the agent's own row");
+    assert_eq!(res[0].0, "mine");
+    let res = db.search("me", &[1.0, 0.0, 0.0], 2).await.unwrap();
+    assert_eq!(res.len(), 1, "agent has only one row");
+
+    // The default agent is scoped the same way.
+    db.upsert("", "glob", "global text", &[0.8, 0.2, 0.0])
+        .await
+        .unwrap();
+    let res = db.search("", &[1.0, 0.0, 0.0], 1).await.unwrap();
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].0, "glob");
+
+    // Rival's own scoped search: exact ties break deterministically by id.
+    let res = db.search("rival", &[1.0, 0.0, 0.0], 2).await.unwrap();
+    assert_eq!(res.len(), 2);
+    assert_eq!(res[0].0, "q", "distance ties order by ascending id");
+    assert_eq!(res[1].0, "q2");
+}
