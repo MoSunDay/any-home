@@ -80,7 +80,7 @@ agent 可以 `ls` 浏览、`cat` 读取、`echo` 写入、`mkdir` 分类，就�
               +--------------v-----------+    +---------------v---------------+
               | link_repos/nfsserve      |    | link_repos/libsql             |
               | user-mode NFSv3 engine   |    | SQLite fork, native vectors   |
-              | NFSFileSystem = boundary |    | vector() / libsql_vector_idx  |
+              | NFSFileSystem = boundary |    | FLOAT32(dim) / scoped KNN     |
               +--------------------------+    +-------------------------------+
 ```
 
@@ -111,6 +111,20 @@ cargo run --features embed-fastembed -- --embedder fastembed --db-path ./anyhome
 cargo run -- --agent-uid botA:1001 --agent-uid botB:1002 --db-path ./anyhome.db
 # 或从凭证文件加载：
 cargo run -- --agent-creds /etc/anyhome/agents.conf
+```
+
+### 2.1 停止与备份
+
+```bash
+# 停止：SIGTERM（或前台 Ctrl-C）。进程会记录优雅停机日志、执行 WAL checkpoint(TRUNCATE)
+# 后以退出码 0 结束；此时 -wal 收敛为空，--db-path 单文件即为完整备份。
+kill -TERM $(pgrep -x anyhome)
+
+# 备份（服务已优雅停止）：单文件拷贝即可
+cp ./anyhome.db /backup/anyhome-$(date +%F).db
+
+# 备份（不停机）：用 SQLite online backup，切勿裸 cp 未收敛的 db（会漏掉 -wal 中未并回的数据）
+sqlite3 ./anyhome.db ".backup /backup/anyhome-$(date +%F).db"
 ```
 
 ### 3. 挂载（需要 `mount.nfs` 与内核 NFS 客户端）
@@ -155,8 +169,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 217 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 221 个测试
+cargo test                              # 222 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 234 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -189,14 +203,14 @@ botB:1002
 | 后端 | Feature | 模型 | `/search` 行为 | 网络 |
 |------|---------|------|----------------|------|
 | `dummy`（默认） | — | 确定性哈希 | 仅精确匹配 | 无 |
-| `fastembed` | `embed-fastembed` | all-MiniLM-L6-v2（dim 384，本地 ONNX） | 真实语义 KNN | 模型仅获取一次（或用 `scripts/fetch-model.sh` 预取） |
+| `fastembed` | `embed-fastembed` | all-MiniLM-L6-v2（dim 384，本地 ONNX） | 真实语义 KNN | 运行时**不联网下载**：模型须预先就位（`scripts/fetch-model.sh`），缓存缺失则进程启动即 fail-fast |
 
 ## 状态
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **217 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **221 个测试通过**
+- `cargo test` = **222 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **234 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
@@ -209,10 +223,12 @@ botB:1002
   `/search_k` 与 `/where` 是只读查询视图（写入 / setattr 返回 `ROFS`）
 - **多 agent 命名空间隔离**：`/agents/<id>/{search,index,where}`，拥有独立的 DB 键空间与检索范围
 - **Agent 身份鉴权（soft auth）**：可选的 `--agent-uid` / `--agent-creds`；AUTH_SYS uid 绑定
-- **向量检索**：libsql 原生 `FLOAT32(dim)` + `libsql_vector_idx`，余弦距离 KNN
+- **向量检索**：libsql 原生 `FLOAT32(dim)` 存储 + agent 分区内暴力余弦 KNN（init-pro-12 收敛；schema v2 起 ANN 索引 `libsql_vector_idx` 已退役，省去逐写维护开销）
 - **持久化与写入耐久性**：写入 `--db-path` 的记忆可跨重启保留；嵌入维度存于 `meta` 表，启动时校验；
   FTS5 索引按需在启动时自动重建。每次 `WRITE` 即写穿 DB（write-through），文件型 DB 用
   `WAL` + `synchronous=FULL`，已提交写 fsync 后存活，崩溃不丢数据（init-pro-6）
+- **优雅停机**：`SIGTERM`/`SIGINT`（Ctrl-C）触发有序收敛——停止接受新负载后执行
+  `PRAGMA wal_checkpoint(TRUNCATE)` 再退出（退出码 0），重启零 WAL 残留（init-pro-13）
 - **CLI**：单端口服务，配置完备
 
 ## 已知限制
