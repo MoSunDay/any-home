@@ -155,8 +155,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 203 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 207 个测试
+cargo test                              # 217 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 221 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -195,8 +195,8 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **203 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **207 个测试通过**
+- `cargo test` = **217 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **221 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
