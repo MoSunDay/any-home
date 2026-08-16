@@ -16,7 +16,7 @@
 //! so the dispatcher can recover the agent context from any magic fileid.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use nfsserve::nfs::*;
 
@@ -310,23 +310,35 @@ pub struct MagicRegistry {
     buffers: Mutex<BufferTable>,
 }
 
+/// Acquire `lock` even if it is poisoned (init-pro-9 TODO-54). A poisoned
+/// lock means some thread once panicked while holding it; every critical
+/// section guarded here is plain `Vec`/`HashMap` bookkeeping without panic
+/// sources of its own (no unwrap/await/IO), so poisoning is unreachable in
+/// practice. Should it ever happen anyway, recovering the (consistent)
+/// bookkeeping is strictly better than crashing the whole NFS server. The
+/// [`MagicRegistry`] signatures are NFS-facing contracts that cannot return
+/// `Result`, so recovery happens here instead.
+fn guard<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl MagicRegistry {
     pub fn register(&self, id: fileid3, entry: MagicEntry) {
-        self.entries.lock().unwrap().entry(id).or_insert(entry);
+        guard(&self.entries).entry(id).or_insert(entry);
     }
 
     pub fn get_entry(&self, id: fileid3) -> Option<MagicEntry> {
-        self.entries.lock().unwrap().get(&id).cloned()
+        guard(&self.entries).get(&id).cloned()
     }
 
     /// Convenience: just the decoded name (for backwards-compatible callers).
     pub fn get(&self, id: fileid3) -> Option<String> {
-        self.entries.lock().unwrap().get(&id).map(|e| e.name.clone())
+        guard(&self.entries).get(&id).map(|e| e.name.clone())
     }
 
     pub fn forget(&self, id: fileid3) {
-        self.entries.lock().unwrap().remove(&id);
-        let mut bufs = self.buffers.lock().unwrap();
+        guard(&self.entries).remove(&id);
+        let mut bufs = guard(&self.buffers);
         if let Some(e) = bufs.map.remove(&id) {
             bufs.total_bytes = bufs.total_bytes.saturating_sub(e.data.len());
         }
@@ -335,9 +347,7 @@ impl MagicRegistry {
     /// All `(id, name)` pairs whose category matches `cat` **and** whose
     /// agent_id matches `agent_id`. Used by readdir for `/search` and `/where`.
     pub fn list_for_cat(&self, cat: u8, agent_id: &str) -> Vec<(fileid3, String)> {
-        self.entries
-            .lock()
-            .unwrap()
+        guard(&self.entries)
             .iter()
             .filter(|(id, e)| magic_category(**id) == cat && e.agent_id == agent_id)
             .map(|(id, e)| (*id, e.name.clone()))
@@ -346,7 +356,7 @@ impl MagicRegistry {
 
     /// Whether an in-flight write buffer already exists for `id`.
     pub fn has_buffer(&self, id: fileid3) -> bool {
-        self.buffers.lock().unwrap().map.contains_key(&id)
+        guard(&self.buffers).map.contains_key(&id)
     }
 
     /// Seed the write buffer for `id` from existing persisted content, but only
@@ -354,7 +364,7 @@ impl MagicRegistry {
     /// always followed by `write_into` in the same RPC, whose splice composes
     /// against it before any eviction may drop the (possibly oversized) entry.
     pub fn seed_buffer(&self, id: fileid3, data: Vec<u8>) {
-        let mut bufs = self.buffers.lock().unwrap();
+        let mut bufs = guard(&self.buffers);
         if bufs.map.contains_key(&id) {
             return;
         }
@@ -370,7 +380,7 @@ impl MagicRegistry {
     /// written buffers first (safe: the DB is authoritative and a subsequent
     /// write to an evicted id re-seeds from it).
     pub fn write_into(&self, id: fileid3, offset: u64, data: &[u8]) -> Vec<u8> {
-        let mut bufs = self.buffers.lock().unwrap();
+        let mut bufs = guard(&self.buffers);
         let out = bufs.splice(id, offset, data);
         bufs.enforce_caps();
         out
@@ -486,5 +496,48 @@ mod tests {
         let out = reg.write_into(id, 5, b"!");
         assert_eq!(out.len(), 6);
         assert_eq!(&out[5..], b"!");
+    }
+
+    #[test]
+    fn poisoned_locks_recover_instead_of_panicking() {
+        // init-pro-9 TODO-54: a panic that once held a registry lock must
+        // not take the server down — `guard` recovers the poisoned lock and
+        // the registry keeps serving (signatures cannot return `Result`).
+        let reg = std::sync::Arc::new(MagicRegistry::default());
+
+        // Poison the buffers lock (panic while holding it).
+        let twin = reg.clone();
+        std::thread::spawn(move || {
+            let mut bufs = twin.buffers.lock().unwrap();
+            bufs.tick = bufs.tick.wrapping_add(1);
+            panic!("deliberate poison");
+        })
+        .join()
+        .unwrap_err();
+        assert!(reg.buffers.lock().is_err(), "buffers mutex must be poisoned");
+
+        // Buffer-backed ops keep working after poisoning.
+        let id = magic_file_id(CAT_INDEX, "after-poison");
+        let out = reg.write_into(id, 0, b"alive");
+        assert_eq!(out, b"alive");
+        assert!(reg.has_buffer(id));
+
+        // Poison the entries lock too; register/lookup/list still work.
+        let twin = reg.clone();
+        std::thread::spawn(move || {
+            let _entries = twin.entries.lock().unwrap();
+            panic!("deliberate poison");
+        })
+        .join()
+        .unwrap_err();
+        assert!(reg.entries.lock().is_err(), "entries mutex must be poisoned");
+
+        let q = magic_file_id(CAT_WHERE, &scoped_name("", "q"));
+        reg.register(q, MagicEntry::new("", "q", CAT_WHERE));
+        assert_eq!(reg.get(q).as_deref(), Some("q"));
+        assert_eq!(reg.get_entry(q).unwrap().name, "q");
+        assert_eq!(reg.list_for_cat(CAT_WHERE, "").len(), 1);
+        reg.forget(q);
+        assert!(reg.get(q).is_none(), "forget works on a poisoned lock pair");
     }
 }
