@@ -143,8 +143,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # with semantic embeddings
 ### 6. Run tests
 
 ```bash
-cargo test                              # 109 tests (default, zero dependencies)
-cargo test --features embed-fastembed   # 113 tests
+cargo test                              # 123 tests (default, zero dependencies)
+cargo test --features embed-fastembed   # 127 tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -183,8 +183,8 @@ botB:1002
 
 The core pipeline is built and fully tested:
 
-- `cargo test` = **109 tests pass** (default, zero dependencies)
-- `cargo test --features embed-fastembed` = **113 tests pass**
+- `cargo test` = **123 tests pass** (default, zero dependencies)
+- `cargo test --features embed-fastembed` = **127 tests pass**
 - `cargo clippy --all-targets -- -D warnings` = **0 warnings** (both feature combinations)
 
 Feature checklist:
@@ -214,10 +214,11 @@ anyhome/
 │   │   ├── main.rs         # binary entry point, builds AnyHomeFs
 │   │   ├── cli.rs          # clap CLI definition
 │   │   ├── dispatcher.rs   # AnyHomeFs: NFSFileSystem dispatch (real fs + magic paths)
+│   │   ├── dispatcher/     # AnyHomeFs inherent-impl submodules (dbops/routing/readdir)
 │   │   ├── auth.rs         # AuthPolicy, CallerCred, AgentCred (soft auth)
 │   │   ├── magic.rs        # magic-path encoding, fileid categorization, MagicRegistry
 │   │   ├── backend/        # RealFs: on-disk filesystem layer
-│   │   └── db/             # MemoryDb (libsql), embedder trait and implementations
+│   │   └── db/             # MemoryDb (libsql): schema/crud/query submodules + embedder
 │   └── tests/              # integration tests (13 files)
 ├── link_repos/             # read-only embedded dependencies (gitignored)
 │   ├── nfsserve/           # user-mode NFSv3 engine (with anyhome fork patch)

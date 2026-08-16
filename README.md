@@ -155,8 +155,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 109 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 113 个测试
+cargo test                              # 123 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 127 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -195,8 +195,8 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **109 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **113 个测试通过**
+- `cargo test` = **123 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **127 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
@@ -240,10 +240,11 @@ anyhome/
 │   │   ├── main.rs         # 二进制入口，构建 AnyHomeFs
 │   │   ├── cli.rs          # clap CLI 定义
 │   │   ├── dispatcher.rs   # AnyHomeFs：NFSFileSystem 分发（真实 fs + 魔法路径）
+│   │   ├── dispatcher/     # AnyHomeFs inherent impl 子模块（dbops/routing/readdir）
 │   │   ├── auth.rs         # AuthPolicy、CallerCred、AgentCred（soft auth）
 │   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
 │   │   ├── backend/        # RealFs：磁盘文件系统层
-│   │   └── db/             # MemoryDb（libsql）、embedder trait 及其实现
+│   │   └── db/             # MemoryDb（libsql）：schema/crud/query 子模块 + embedder
 │   └── tests/              # 集成测试（13 个文件）
 ├── link_repos/             # 只读内嵌依赖（gitignored）
 │   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
