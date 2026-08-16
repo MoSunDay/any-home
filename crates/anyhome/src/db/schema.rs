@@ -1,7 +1,7 @@
-//! Schema lifecycle for [`MemoryDb`]: table/index/FTS creation, sync
-//! triggers, idempotent migrations, and dim bookkeeping. Split out of
-//! `db/mod.rs` (init-pro-9 TODO-52); behavior-neutral inherent-impl
-//! continuation, all methods stay crate-private via `pub(super)`.
+//! Schema lifecycle for [`MemoryDb`]: table/FTS creation, sync triggers,
+//! idempotent migrations, and dim bookkeeping. Split out of `db/mod.rs`
+//! (init-pro-9 TODO-52); behavior-neutral inherent-impl continuation, all
+//! methods stay crate-private via `pub(super)`.
 
 use anyhow::{anyhow, Context, Result};
 use libsql::params;
@@ -9,7 +9,7 @@ use libsql::params;
 use super::MemoryDb;
 
 /// Current schema version understood by this code.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 impl MemoryDb {
     pub(super) async fn init_schema(&self) -> Result<()> {
@@ -29,15 +29,6 @@ impl MemoryDb {
             .execute(&create_table, ())
             .await
             .context("create memories table")?;
-        // Vector index: no USING clause, default metric = cosine.
-        self.conn
-            .execute(
-                "CREATE INDEX IF NOT EXISTS memories_vec_idx \
-                 ON memories ( libsql_vector_idx(emb) )",
-                (),
-            )
-            .await
-            .context("create vector index")?;
 
         // Metadata table (persistence bookkeeping: recorded dim, schema version).
         self.conn
@@ -149,7 +140,15 @@ impl MemoryDb {
     /// from `key` (column-level) to `(agent_id, key)` (table-level). Since
     /// SQLite cannot ALTER a column constraint, this is done via the standard
     /// table-rebuild pattern: create new table → copy data → drop old → rename
-    /// → recreate vector index + FTS triggers.
+    /// → recreate FTS triggers.
+    ///
+    /// v1 -> v2: retires the ANN index `memories_vec_idx` (init-pro-13). Since
+    /// init-pro-12 (TODO-68) search is a scoped brute-force KNN over the
+    /// agent's partition, nothing queries the index anymore and every write
+    /// paid its maintenance cost. A plain `DROP INDEX` makes libsql cascade-drop
+    /// the shadow table, its index, and the `libsql_vector_meta_shadow` row;
+    /// this step runs unconditionally so v0 DBs (rebuilt index-less above or
+    /// carrying a stale index) end up in the same shape as v1 DBs.
     pub(super) async fn migrate_schema(&self) -> Result<()> {
         let version = self.schema_version().await?;
         if version >= SCHEMA_VERSION {
@@ -183,15 +182,6 @@ impl MemoryDb {
                 .execute("ALTER TABLE memories_new RENAME TO memories", ())
                 .await
                 .context("rename memories_new")?;
-            // Recreate vector index (not carried over by the rebuild).
-            self.conn
-                .execute(
-                    "CREATE INDEX IF NOT EXISTS memories_vec_idx \
-                     ON memories ( libsql_vector_idx(emb) )",
-                    (),
-                )
-                .await
-                .context("recreate vector index after migration")?;
             // Recreate FTS5 triggers (DROP TABLE removed them).
             self.create_fts_triggers().await?;
             // Rebuild FTS index to ensure rowid consistency.
@@ -200,6 +190,15 @@ impl MemoryDb {
                 .await
                 .context("rebuild fts after migration")?;
         }
+        // v1 -> v2: retire the idle ANN index. Since init-pro-12 (TODO-68) search
+        // is a scoped brute-force KNN over the agent's partition; nothing queries
+        // memories_vec_idx anymore, so keep only its write-maintenance cost. A
+        // plain DROP INDEX makes libsql cascade-drop the shadow table, its index,
+        // and the libsql_vector_meta_shadow metadata row.
+        self.conn
+            .execute("DROP INDEX IF EXISTS memories_vec_idx", ())
+            .await
+            .context("drop retired vector index")?;
         self.set_schema_version(SCHEMA_VERSION).await?;
         Ok(())
     }
@@ -255,6 +254,25 @@ impl MemoryDb {
                 .execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')", ())
                 .await
                 .context("rebuild memories_fts")?;
+        }
+        Ok(())
+    }
+
+    /// Validate an embedding against the db dim before it is written.
+    ///
+    /// While `memories_vec_idx` existed, libSQL's vector-index insert path
+    /// rejected mismatched dims ("vector index(insert): dimensions are
+    /// different"). The index was retired in v2, so the write path keeps that
+    /// gate itself: a wrong-dim row would otherwise be stored silently and
+    /// poison every later `vector_distance_cos` scan over the partition.
+    pub(super) fn check_emb_dim(&self, emb: &[f32]) -> Result<()> {
+        if emb.len() != self.dim {
+            return Err(anyhow!(
+                "vector dimensions are different: {got} != {dim} \
+                 (upsert embedding must match the db dim)",
+                got = emb.len(),
+                dim = self.dim
+            ));
         }
         Ok(())
     }

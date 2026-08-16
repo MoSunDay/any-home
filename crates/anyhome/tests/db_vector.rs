@@ -1,6 +1,8 @@
 //! End-to-end vector store behavior. `smoke_vector_top_k` is the hard gate for
-//! the project: it proves the libSQL vector index actually orders results by
-//! cosine similarity (not just that queries don't crash).
+//! the project: it proves the brute-force KNN search actually orders results
+//! by cosine similarity (not just that queries don't crash). Search has been a
+//! scoped cosine scan over the agent's partition since init-pro-12 (TODO-68);
+//! the ANN index was retired in init-pro-13.
 
 use anyhome::db::{dummy_embed, DummyEmbedder, Embedder, MemoryDb};
 use anyhome::db::vec_to_json;

@@ -11,6 +11,9 @@ use super::{vec_to_json, MemoryDb};
 impl MemoryDb {
     /// Insert or replace the memory under `(agent_id, key)`.
     pub async fn upsert(&self, agent_id: &str, key: &str, text: &str, emb: &[f32]) -> Result<()> {
+        // Dim gate formerly enforced by the vector-index insert path (schema v2
+        // retired the index; see `check_emb_dim`).
+        self.check_emb_dim(emb)?;
         let json = vec_to_json(emb);
         self.conn
             .execute(

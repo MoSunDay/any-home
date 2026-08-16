@@ -141,6 +141,30 @@ async fn agent_id_migration_from_v0() {
         db.get_text("", "old1").await.unwrap().as_deref(),
         Some("legacy data")
     );
+    drop(db);
+
+    // The same migration run also applies the v1 -> v2 step (init-pro-13):
+    // the v0-era ANN index must be gone afterwards and the version stamped 2.
+    let raw = Builder::new_local(p).build().await.unwrap();
+    let conn = raw.connect().unwrap();
+    let mut rows = conn
+        .query("SELECT name FROM sqlite_master ORDER BY name", ())
+        .await
+        .unwrap();
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        names.push(row.get::<String>(0).unwrap());
+    }
+    assert!(
+        !names.iter().any(|n| n == "memories_vec_idx"),
+        "retired ANN index must be gone after migration: {names:?}"
+    );
+    let mut rows = conn
+        .query("SELECT value FROM meta WHERE key = 'schema_version'", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("schema_version stamped");
+    assert_eq!(row.get::<String>(0).unwrap(), "2");
 }
 
 /// The unique constraint is `(agent_id, key)`, so the same key may exist under
