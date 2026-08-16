@@ -155,8 +155,8 @@ ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 149 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 153 个测试
+cargo test                              # 203 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 207 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -195,8 +195,8 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **149 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **153 个测试通过**
+- `cargo test` = **203 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **207 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
@@ -245,7 +245,7 @@ anyhome/
 │   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
 │   │   ├── backend/        # RealFs：磁盘文件系统层
 │   │   └── db/             # MemoryDb（libsql）：schema/crud/query 子模块 + embedder
-│   └── tests/              # 集成测试（16 个文件）
+│   └── tests/              # 集成测试（20 个文件）
 ├── link_repos/             # 只读内嵌依赖（gitignored）
 │   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
 │   └── libsql/             # 原生支持向量检索的 SQLite 衍生分支
