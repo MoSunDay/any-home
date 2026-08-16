@@ -263,7 +263,11 @@ impl MemoryDb {
         // `table` is a fixed internal identifier, never user input.
         let sql = format!("SELECT count(*) FROM {table}");
         let mut rows = self.conn.query(&sql, ()).await.context("count rows")?;
-        let row = rows.next().await.context("fetch count row")?.unwrap();
+        let row = rows
+            .next()
+            .await
+            .context("fetch count row")?
+            .ok_or_else(|| anyhow!("count query returned no row for {table}"))?;
         Ok(row.get::<i64>(0)?)
     }
 }

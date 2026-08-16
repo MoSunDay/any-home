@@ -63,7 +63,11 @@ impl RealFs {
     // --- map helpers (lock briefly; never held across an await) ---
 
     fn path_of(&self, id: fileid3) -> std::result::Result<PathBuf, nfsstat3> {
-        let maps = self.state.lock().unwrap();
+        // A poisoned lock means a panic once occurred while holding it; the
+        // guarded maps are pure id/path bookkeeping (no invariants beyond
+        // HashMap consistency), so degrade to a recoverable per-RPC IO error
+        // instead of taking down the whole server (init-pro-9 TODO-53).
+        let maps = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
         maps.id_to_path
             .get(&id)
             .cloned()
@@ -87,7 +91,7 @@ impl RealFs {
         if path == self.root {
             return Ok(ROOT_ID);
         }
-        let mut maps = self.state.lock().unwrap();
+        let mut maps = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
         if let Some(&id) = maps.path_to_id.get(&path) {
             return Ok(id);
         }
@@ -280,7 +284,7 @@ impl NFSFileSystem for RealFs {
         let path = dirpath.join(OsStr::from_bytes(filename));
         let meta = std::fs::symlink_metadata(&path).map_err(|_| nfsstat3::NFS3ERR_NOENT)?;
         let cached_id = {
-            let maps = self.state.lock().unwrap();
+            let maps = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
             maps.path_to_id.get(&path).copied()
         };
         let res = if meta.is_dir() {
@@ -290,7 +294,7 @@ impl NFSFileSystem for RealFs {
         };
         res.map_err(|_| nfsstat3::NFS3ERR_IO)?;
         if let Some(id) = cached_id {
-            let mut maps = self.state.lock().unwrap();
+            let mut maps = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
             maps.id_to_path.remove(&id);
             maps.path_to_id.remove(&path);
         }
@@ -312,7 +316,7 @@ impl NFSFileSystem for RealFs {
             .await
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
         // Same inode: keep the id, just repoint the path mapping.
-        let mut maps = self.state.lock().unwrap();
+        let mut maps = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
         if let Some(&id) = maps.path_to_id.get(&from_path) {
             maps.path_to_id.remove(&from_path);
             maps.path_to_id.insert(to_path.clone(), id);
@@ -389,5 +393,44 @@ impl NFSFileSystem for RealFs {
             entries: filtered,
             end,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Lock-poisoning recovery (init-pro-9 TODO-53): a panic that once held
+    //! the shared id/path map lock must degrade subsequent RPCs to
+    //! `NFS3ERR_IO`, never panic the whole server.
+
+    use nfsserve::vfs::NFSFileSystem;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn poisoned_map_lock_returns_io_error_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = RealFs::new(dir.path().to_path_buf()).unwrap();
+
+        // Poison the lock: clone shares the same `Arc<Mutex<Maps>>`, and the
+        // thread panics while holding it.
+        let twin = fs.clone();
+        std::thread::spawn(move || {
+            let _guard = twin.state.lock().unwrap();
+            panic!("deliberate poison");
+        })
+        .join()
+        .unwrap_err();
+        assert!(fs.state.lock().is_err(), "mutex must be poisoned");
+
+        // Every map-dependent operation now yields a recoverable IO error.
+        let err = fs.lookup(ROOT_ID, &b"x"[..].into()).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_IO));
+        let err = fs.getattr(ROOT_ID).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_IO));
+        let err = fs
+            .create(ROOT_ID, &b"y"[..].into(), sattr3::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_IO));
     }
 }
