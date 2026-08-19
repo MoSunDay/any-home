@@ -30,10 +30,11 @@
 - 手动挂载：`echo "rust async io">/mnt/index/k1 && cat /mnt/search/async` 命中
 
 ## 状态
-pending
+done
 
 ## 证据
-（完成后填）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- `tests/anyhome_magic.rs`（`169b627`）exact-match 管线 + 普通路径回归全绿；后续硬化：init-pro-3 TODO-14..20（写入正确性/句柄健壮性）、init-pro-12 TODO-68 mkdir 守卫。
 
 ## 卡点
 - 查询路径编码（空格 escape）

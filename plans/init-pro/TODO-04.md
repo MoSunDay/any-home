@@ -19,10 +19,11 @@
 - 与 TODO-03 联动 spot check 召回顺序
 
 ## 状态
-**blocked-decision**
+done
 
 ## 证据
-（决策后填）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- 决策闭环：选方案 (A) 本地 ONNX（fastembed，`Qdrant/all-MiniLM-L6-v2-onnx`，dim 384），在 init-pro-2 TODO-08..13 交付；见 `plans/init-pro-2/TODO-10.md`（状态 done，语义不等式 3/3 passed）与 `plans/init-pro/index.md:51` 的闭环记录。
 
 ## 卡点
 **需决策** (A) vs (B)——维度：是否允许联网 / 接受原生依赖 / 模型文件分发方式。

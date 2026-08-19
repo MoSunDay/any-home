@@ -59,10 +59,11 @@ async fn smoke_vector_top_k() {
 - **smoke_vector_top_k 通过**（硬门禁）
 
 ## 状态
-pending
+done
 
 ## 证据
-（测试名 + passed；冒烟结果）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- vector 冒烟非-ignore 且通过：`tests/db_vector.rs`（`169b627`）至今日基线全绿；演进：init-pro-4 加 agent_id 列、init-pro-9 TODO-52 拆 schema/crud/query、init-pro-12 TODO-68 改 agent 分区 KNN、init-pro-13 TODO-74 schema v2 退役 ANN 索引。
 
 ## 卡点
 - vector 冒烟是第一道关，过不了则 TODO-03 全停。

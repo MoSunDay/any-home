@@ -18,10 +18,11 @@
 - 手动 mount（用 TODO-07 的 mount 命令）成功
 
 ## 状态
-pending
+done
 
 ## 证据
-（完成后填）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- `cli.rs` 单测（`--help`/参数解析）+ `169b627` 组装链落地；演进：init-pro-5 TODO-28..34 加 `--agent-uid`/`--agent-creds`、init-pro-2 加 `--embedder`、init-pro-13 TODO-73 优雅停机。
 
 ## 卡点
 - Embedder 选择依赖 TODO-04；未决策前 main 默认 DummyEmbedder 并 warn。

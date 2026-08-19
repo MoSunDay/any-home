@@ -25,10 +25,11 @@
 - `cargo test -p anyhome` 绿
 
 ## 状态
-pending
+done
 
 ## 证据
-（测试名 + passed 数；e2e 操作）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- `tests/realfs.rs`（`169b627` 引入）至今全绿；e2e 真实文件 facet（init-pro-12）live 断言过。
 
 ## 卡点
 - `fattr3` 字段多易错——**直接用** `fs_util::metadata_to_fattr3`（`fs_util.rs:39`），不自拼。

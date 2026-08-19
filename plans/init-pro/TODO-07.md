@@ -29,10 +29,11 @@
 - README 链接有效
 
 ## 状态
-pending
+done
 
 ## 证据
-（e2e 退出码、断言尾段）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- `scripts/e2e.sh`（`169b627`）建立；live 证据链：init-pro-10 TODO-61 与 init-pro-12/13（TODO-76）`--require-mount` 真实 mount 多轮 exit 0，最新 2026-08-16 端口 21111 全绿；README「使用」小节自首轮起维护。
 
 ## 卡点
 - 需 root `mount.nfs`（CI 无权限 -> `e2e:manual`）

@@ -24,10 +24,12 @@
 4. `rustc --version` = 1.85.0（rust-toolchain 生效）
 
 ## 状态
-pending
+done
 
 ## 证据
-（完成后填：build 尾段、cargo tree、耗时、rustc 版本）
+- （2026-08-18 回填，init-pro-14 TODO-78：首轮文档状态欠账，技术内容零改动）
+- MVP commit `169b627`（2026-07-19）一次落地 TODO-01..07：工作区拓扑与计划一致——members 仅 `crates/anyhome`、`rust-toolchain.toml` 钉 1.85.0、`scripts/bootstrap.sh` 钉 commit checkout，commit gate 自记 "cargo test --workspace (19 pass) / clippy -D warnings (0) / build clean"。
+- 今日基线复跑（init-pro-14）：`cargo test --workspace` 全绿即工作区拓扑仍成立。
 
 ## 卡点
 - 首次冷构建 libsql-ffi 的 bundled `sqlite3.c`（269269 行）单 cc 调用，预计数分钟。
