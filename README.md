@@ -164,13 +164,14 @@ echo "# my notes" > /mnt/anyhome/notes/readme.md
 scripts/e2e.sh                          # 无 mount.nfs 则跳过
 scripts/e2e.sh --require-mount          # 无 mount.nfs 则硬失败
 ANYHOME_EMBEDDER=fastembed scripts/e2e.sh  # 带语义嵌入
+cargo test --test e2e_mount -- --nocapture  # Rust 版本地挂载 e2e（可挂载主机自动真挂载；无 mount.nfs/非 root 自动跳过，ANYHOME_REQUIRE_MOUNT=1 强制）
 ```
 
 ### 6. 运行测试
 
 ```bash
-cargo test                              # 222 个测试（默认，零依赖）
-cargo test --features embed-fastembed   # 234 个测试
+cargo test                              # 223 个测试（默认，零依赖）
+cargo test --features embed-fastembed   # 235 个测试
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -209,8 +210,8 @@ botB:1002
 
 核心管线已构建并通过完整测试：
 
-- `cargo test` = **222 个测试通过**（默认，零依赖）
-- `cargo test --features embed-fastembed` = **234 个测试通过**
+- `cargo test` = **223 个测试通过**（默认，零依赖）
+- `cargo test --features embed-fastembed` = **235 个测试通过**
 - `cargo clippy --all-targets -- -D warnings` = **0 警告**（两种 feature 组合）
 
 能力清单：
@@ -261,7 +262,7 @@ anyhome/
 │   │   ├── magic.rs        # 魔法路径编码、fileid 分类、MagicRegistry
 │   │   ├── backend/        # RealFs：磁盘文件系统层
 │   │   └── db/             # MemoryDb（libsql）：schema/crud/query 子模块 + embedder
-│   └── tests/              # 集成测试（20 个文件）
+│   └── tests/              # 集成测试（23 个文件）
 ├── link_repos/             # 只读内嵌依赖（gitignored）
 │   ├── nfsserve/           # 用户态 NFSv3 引擎（含 anyhome fork 补丁）
 │   └── libsql/             # 原生支持向量检索的 SQLite 衍生分支
